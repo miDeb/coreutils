@@ -195,22 +195,29 @@ impl SelectionRange {
     }
 }
 
-enum NumCache {
-    AsF64(f64),
-    WithInfo(NumInfo),
+enum Precomputed {
+    F64(f64),
+    NumInfo(NumInfo),
+    Hash(u64),
     None,
 }
 
-impl NumCache {
+impl Precomputed {
     fn as_f64(&self) -> f64 {
         match self {
-            NumCache::AsF64(n) => *n,
+            Precomputed::F64(n) => *n,
             _ => unreachable!(),
         }
     }
     fn as_num_info(&self) -> &NumInfo {
         match self {
-            NumCache::WithInfo(n) => n,
+            Precomputed::NumInfo(n) => n,
+            _ => unreachable!(),
+        }
+    }
+    fn as_hash(&self) -> u64 {
+        match self {
+            Precomputed::Hash(hash) => *hash,
             _ => unreachable!(),
         }
     }
@@ -218,7 +225,7 @@ impl NumCache {
 
 struct Selection {
     range: SelectionRange,
-    num_cache: NumCache,
+    precomputed: Precomputed,
 }
 
 impl Selection {
@@ -278,13 +285,15 @@ impl Line {
                         },
                     );
                     range.shorten(num_range);
-                    NumCache::WithInfo(info)
+                    Precomputed::NumInfo(info)
                 } else if selector.settings.mode == SortMode::GeneralNumeric {
-                    NumCache::AsF64(permissive_f64_parse(get_leading_gen(range.get_str(&line))))
+                    Precomputed::F64(permissive_f64_parse(get_leading_gen(range.get_str(&line))))
+                } else if selector.settings.random {
+                    Precomputed::Hash(get_hash(&[range.get_str(&line), &settings.salt]))
                 } else {
-                    NumCache::None
+                    Precomputed::None
                 };
-                Selection { range, num_cache }
+                Selection { range, precomputed: num_cache }
             })
             .collect();
         Self { line, selections }
@@ -997,16 +1006,16 @@ fn compare_by(a: &Line, b: &Line, global_settings: &GlobalSettings) -> Ordering 
         let settings = &selector.settings;
 
         let cmp: Ordering = if settings.random {
-            random_shuffle(a_str, b_str, global_settings.salt.clone())
+            a_selection.precomputed.as_hash().cmp(&b_selection.precomputed.as_hash())
         } else {
             match settings.mode {
                 SortMode::Numeric | SortMode::HumanNumeric => numeric_str_cmp(
-                    (a_str, a_selection.num_cache.as_num_info()),
-                    (b_str, b_selection.num_cache.as_num_info()),
+                    (a_str, a_selection.precomputed.as_num_info()),
+                    (b_str, b_selection.precomputed.as_num_info()),
                 ),
                 SortMode::GeneralNumeric => general_numeric_compare(
-                    a_selection.num_cache.as_f64(),
-                    b_selection.num_cache.as_f64(),
+                    a_selection.precomputed.as_f64(),
+                    b_selection.precomputed.as_f64(),
                 ),
                 SortMode::Month => month_compare(a_str, b_str),
                 SortMode::Version => version_compare(a_str, b_str),
@@ -1146,7 +1155,6 @@ fn get_rand_string() -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
-        .map(char::from)
         .collect::<String>()
 }
 
@@ -1154,16 +1162,6 @@ fn get_hash<T: Hash>(t: &T) -> u64 {
     let mut s: FnvHasher = Default::default();
     t.hash(&mut s);
     s.finish()
-}
-
-fn random_shuffle(a: &str, b: &str, x: String) -> Ordering {
-    #![allow(clippy::comparison_chain)]
-    let salt_slice = x.as_str();
-
-    let da = get_hash(&[a, salt_slice].concat());
-    let db = get_hash(&[b, salt_slice].concat());
-
-    da.cmp(&db)
 }
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
@@ -1319,15 +1317,6 @@ mod tests {
     }
 
     #[test]
-    fn test_random_shuffle() {
-        let a = "Ted";
-        let b = "Ted";
-        let c = get_rand_string();
-
-        assert_eq!(Ordering::Equal, random_shuffle(a, b, c));
-    }
-
-    #[test]
     fn test_default_compare() {
         let a = "your own";
         let b = "your place";
@@ -1348,15 +1337,6 @@ mod tests {
         let b = "1.4.0";
 
         assert_eq!(Ordering::Less, version_compare(a, b));
-    }
-
-    #[test]
-    fn test_random_compare() {
-        let a = "9";
-        let b = "9";
-        let c = get_rand_string();
-
-        assert_eq!(Ordering::Equal, random_shuffle(a, b, c));
     }
 
     #[test]
