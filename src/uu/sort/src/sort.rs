@@ -25,6 +25,7 @@ use external_sort::ext_sort;
 use fnv::FnvHasher;
 use itertools::Itertools;
 use numeric_str_cmp::{numeric_str_cmp, NumInfo, NumInfoParseSettings};
+use ouroboros::self_referencing;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
@@ -36,7 +37,9 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
+use std::marker::PhantomData;
 use std::mem::replace;
+use std::ops::Deref;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
@@ -205,28 +208,6 @@ impl From<&GlobalSettings> for KeySettings {
     }
 }
 
-#[derive(Debug, Clone)]
-/// Represents the string selected by a FieldSelector.
-struct SelectionRange {
-    range: Range<usize>,
-}
-
-impl SelectionRange {
-    fn new(range: Range<usize>) -> Self {
-        Self { range }
-    }
-
-    /// Gets the actual string slice represented by this Selection.
-    fn get_str<'a>(&self, line: &'a str) -> &'a str {
-        &line[self.range.to_owned()]
-    }
-
-    fn shorten(&mut self, new_range: Range<usize>) {
-        self.range.end = self.range.start + new_range.end;
-        self.range.start += new_range.start;
-    }
-}
-
 #[derive(Clone)]
 enum NumCache {
     AsF64(GeneralF64ParseResult),
@@ -249,64 +230,83 @@ impl NumCache {
 }
 
 #[derive(Clone)]
-struct Selection {
-    range: SelectionRange,
+struct Selection<'a> {
+    range: &'a str,
     num_cache: Option<Box<NumCache>>,
-}
-
-impl Selection {
-    /// Gets the actual string slice represented by this Selection.
-    fn get_str<'a>(&'a self, line: &'a Line) -> &'a str {
-        self.range.get_str(&line.line)
-    }
 }
 
 type Field = Range<usize>;
 
+#[self_referencing]
 #[derive(Clone)]
-pub struct Line {
-    line: Box<str>,
+pub struct Line<'a, T>
+where
+    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+{
+    original: T,
     // The common case is not to specify fields. Let's make this fast.
-    first_selection: Selection,
-    other_selections: Box<[Selection]>,
+    #[borrows(original)]
+    #[covariant]
+    first_selection: Selection<'this>,
+    #[borrows(original)]
+    #[covariant]
+    other_selections: Box<[Selection<'this>]>,
+    #[covariant]
+    p: PhantomData<&'a str>,
 }
 
-impl Line {
-    /// Estimate the number of bytes that this Line is occupying
-    pub fn estimate_size(&self) -> usize {
-        self.line.len()
-            + self.other_selections.len() * std::mem::size_of::<Selection>()
+type OwningLine = Line<'static, Box<str>>;
+
+// SAFETY: Sending a Line struct is safe, but due to what ouroboros internally does to it it's no longer automatically inferred.
+unsafe impl<'a, T> Send for Line<'a, T> where
+    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref
+{
+}
+
+impl OwningLine {
+    fn estimate_size(&self) -> usize {
+        self.borrow_original().len()
+            + self.borrow_other_selections().len() * std::mem::size_of::<Selection>()
             + std::mem::size_of::<Self>()
     }
+}
 
-    pub fn new(line: String, settings: &GlobalSettings) -> Self {
+impl<'a, T> Line<'a, T>
+where
+    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+{
+    fn create(string: T, settings: &GlobalSettings) -> Self {
         let fields = if settings
             .selectors
             .iter()
             .any(|selector| selector.needs_tokens())
         {
             // Only tokenize if we will need tokens.
-            Some(tokenize(&line, settings.separator))
+            Some(tokenize(string.as_ref(), settings.separator))
         } else {
             None
         };
 
-        let mut selectors = settings.selectors.iter();
-
-        let first_selection = selectors
-            .next()
-            .unwrap()
-            .get_selection(&line, fields.as_deref());
-
-        let other_selections: Vec<Selection> = selectors
-            .map(|selector| selector.get_selection(&line, fields.as_deref()))
-            .collect();
-
-        Self {
-            line: line.into_boxed_str(),
-            first_selection,
-            other_selections: other_selections.into_boxed_slice(),
+        LineBuilder {
+            original: string,
+            first_selection_builder: |original| {
+                settings
+                    .selectors
+                    .first()
+                    .unwrap()
+                    .get_selection(original, fields.as_deref())
+            },
+            other_selections_builder: |original| {
+                settings
+                    .selectors
+                    .iter()
+                    .skip(1)
+                    .map(|selector| selector.get_selection(original, fields.as_deref()))
+                    .collect()
+            },
+            p: PhantomData,
         }
+        .build()
     }
 
     /// Writes indicators for the selections this line matched. The original line content is NOT expected
@@ -320,17 +320,17 @@ impl Line {
         // which are not a performance problem in any case. Therefore there aren't any special performance
         // optimizations here.
 
-        let line = self.line.replace('\t', ">");
+        let line = self.borrow_original().replace('\t', ">");
         writeln!(writer, "{}", line)?;
 
-        let fields = tokenize(&self.line, settings.separator);
+        let fields = tokenize(&self.borrow_original(), settings.separator);
         for selector in settings.selectors.iter() {
-            let mut selection = selector.get_range(&self.line, Some(&fields));
+            let mut selection = selector.get_range(&self.borrow_original(), Some(&fields));
             match selector.settings.mode {
                 SortMode::Numeric | SortMode::HumanNumeric => {
                     // find out which range is used for numeric comparisons
                     let (_, num_range) = NumInfo::parse(
-                        &self.line[selection.clone()],
+                        &self.borrow_original()[selection.clone()],
                         NumInfoParseSettings {
                             accept_si_units: selector.settings.mode == SortMode::HumanNumeric,
                             thousands_separator: Some(THOUSANDS_SEP),
@@ -345,21 +345,21 @@ impl Line {
 
                     // include a trailing si unit
                     if selector.settings.mode == SortMode::HumanNumeric
-                        && self.line[selection.end..initial_selection.end]
+                        && self.borrow_original()[selection.end..initial_selection.end]
                             .starts_with(&['k', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'][..])
                     {
                         selection.end += 1;
                     }
 
                     // include leading zeroes, a leading minus or a leading decimal point
-                    while self.line[initial_selection.start..selection.start]
+                    while self.borrow_original()[initial_selection.start..selection.start]
                         .ends_with(&['-', '0', '.'][..])
                     {
                         selection.start -= 1;
                     }
                 }
                 SortMode::GeneralNumeric => {
-                    let initial_selection = &self.line[selection.clone()];
+                    let initial_selection = &self.borrow_original()[selection.clone()];
 
                     let leading = get_leading_gen(initial_selection);
 
@@ -368,7 +368,7 @@ impl Line {
                     selection.end = selection.start + leading.len();
                 }
                 SortMode::Month => {
-                    let initial_selection = &self.line[selection.clone()];
+                    let initial_selection = &self.borrow_original()[selection.clone()];
 
                     let month = if month_parse(initial_selection) == Month::Unknown {
                         // We failed to parse a month, which is equivalent to matching nothing.
@@ -419,7 +419,7 @@ impl Line {
                 || settings.mode != SortMode::Default))
         {
             // A last resort comparator is in use, underline the whole line.
-            if self.line.is_empty() {
+            if self.borrow_original().is_empty() {
                 writeln!(writer, "^ no match for key")?;
             } else {
                 writeln!(
@@ -584,14 +584,14 @@ impl FieldSelector {
 
     /// Get the selection that corresponds to this selector for the line.
     /// If needs_fields returned false, tokens may be None.
-    fn get_selection(&self, line: &str, tokens: Option<&[Field]>) -> Selection {
-        let mut range = SelectionRange::new(self.get_range(&line, tokens));
+    fn get_selection<'a>(&self, line: &'a str, tokens: Option<&[Field]>) -> Selection<'a> {
+        let mut range = &line[self.get_range(&line, tokens)];
         let num_cache = if self.settings.mode == SortMode::Numeric
             || self.settings.mode == SortMode::HumanNumeric
         {
             // Parse NumInfo for this number.
             let (info, num_range) = NumInfo::parse(
-                range.get_str(&line),
+                range,
                 NumInfoParseSettings {
                     accept_si_units: self.settings.mode == SortMode::HumanNumeric,
                     thousands_separator: Some(THOUSANDS_SEP),
@@ -599,13 +599,12 @@ impl FieldSelector {
                 },
             );
             // Shorten the range to what we need to pass to numeric_str_cmp later.
-            range.shorten(num_range);
+            range = &range[num_range];
             Some(Box::new(NumCache::WithInfo(info)))
         } else if self.settings.mode == SortMode::GeneralNumeric {
             // Parse this number as f64, as this is the requirement for general numeric sorting.
-            let str = range.get_str(&line);
             Some(Box::new(NumCache::AsF64(general_f64_parse(
-                &str[get_leading_gen(str)],
+                &range[get_leading_gen(range)],
             ))))
         } else {
             // This is not a numeric sort, so we don't need a NumCache.
@@ -702,8 +701,8 @@ impl FieldSelector {
 }
 
 struct MergeableFile<'a> {
-    lines: Box<dyn Iterator<Item = Line> + 'a>,
-    current_line: Line,
+    lines: Box<dyn Iterator<Item = OwningLine> + 'a>,
+    current_line: OwningLine,
     settings: &'a GlobalSettings,
 }
 
@@ -742,7 +741,7 @@ impl<'a> FileMerger<'a> {
             settings,
         }
     }
-    fn push_file(&mut self, mut lines: Box<dyn Iterator<Item = Line> + 'a>) {
+    fn push_file(&mut self, mut lines: Box<dyn Iterator<Item = OwningLine> + 'a>) {
         if let Some(next_line) = lines.next() {
             let mergeable_file = MergeableFile {
                 lines,
@@ -755,8 +754,8 @@ impl<'a> FileMerger<'a> {
 }
 
 impl<'a> Iterator for FileMerger<'a> {
-    type Item = Line;
-    fn next(&mut self) -> Option<Line> {
+    type Item = OwningLine;
+    fn next(&mut self) -> Option<OwningLine> {
         match self.heap.pop() {
             Some(mut current) => {
                 match current.lines.next() {
@@ -1132,7 +1131,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 fn file_to_lines_iter(
     file: impl AsRef<OsStr>,
     settings: &'_ GlobalSettings,
-) -> Option<impl Iterator<Item = Line> + '_> {
+) -> Option<impl Iterator<Item = OwningLine> + '_> {
     let (reader, _) = match open(file) {
         Some(x) => x,
         None => return None,
@@ -1148,15 +1147,18 @@ fn file_to_lines_iter(
                 b'\n'
             })
             .map(move |line| {
-                Line::new(
-                    crash_if_err!(1, String::from_utf8(crash_if_err!(1, line))),
+                Line::create(
+                    crash_if_err!(1, String::from_utf8(crash_if_err!(1, line))).into_boxed_str(),
                     settings,
                 )
             }),
     )
 }
 
-fn output_sorted_lines(iter: impl Iterator<Item = Line>, settings: &GlobalSettings) {
+fn output_sorted_lines<'a, T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref>(
+    iter: impl Iterator<Item = Line<'a, T>>,
+    settings: &GlobalSettings,
+) {
     if settings.unique {
         print_sorted(
             iter.dedup_by(|a, b| compare_by(a, b, &settings) == Ordering::Equal),
@@ -1177,47 +1179,52 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
             file_merger.push_file(Box::new(lines));
         }
         output_sorted_lines(file_merger, &settings);
-    } else {
+    } else if settings.check {
         let lines = files
             .iter()
             .filter_map(|file| file_to_lines_iter(file, &settings))
             .flatten();
 
-        if settings.check {
-            return exec_check_file(lines, &settings);
-        }
+        return exec_check_file(lines, &settings);
+    } else if settings.ext_sort {
+        let lines = files
+            .iter()
+            .filter_map(|file| file_to_lines_iter(file, &settings))
+            .flatten();
 
-        // Only use ext_sorter when we need to.
-        // Probably faster that we don't create
-        // an owned value each run
-        if settings.ext_sort {
-            let sorted_lines = ext_sort(lines, &settings);
-            output_sorted_lines(sorted_lines, &settings);
-        } else {
-            let mut lines = vec![];
+        let sorted = ext_sort(lines, &settings);
+        output_sorted_lines(sorted, &settings);
+    } else {
+        let separator = if settings.zero_terminated { '\0' } else { '\n' };
+        let mut lines = vec![];
+        let mut full_string = String::new();
 
-            // This is duplicated from fn file_to_lines_iter, but using that function directly results in a performance regression.
-            for (file, _) in files.iter().map(open).flatten() {
-                let buf_reader = BufReader::new(file);
-                for line in buf_reader.split(if settings.zero_terminated {
-                    b'\0'
-                } else {
-                    b'\n'
-                }) {
-                    let string = crash_if_err!(1, String::from_utf8(crash_if_err!(1, line)));
-                    lines.push(Line::new(string, &settings));
-                }
+        for (mut file, _) in files.iter().map(open).flatten() {
+            crash_if_err!(1, file.read_to_string(&mut full_string));
+
+            if !full_string.ends_with(separator) {
+                full_string.push(separator);
             }
-
-            sort_by(&mut lines, &settings);
-            output_sorted_lines(lines.into_iter(), &settings);
         }
-    }
 
+        if full_string.ends_with(separator) {
+            full_string.pop();
+        }
+
+        for line in full_string.split(if settings.zero_terminated { '\0' } else { '\n' }) {
+            lines.push(Line::create(line, &settings));
+        }
+
+        sort_by(&mut lines, &settings);
+        output_sorted_lines(lines.into_iter(), &settings);
+    }
     0
 }
 
-fn exec_check_file(unwrapped_lines: impl Iterator<Item = Line>, settings: &GlobalSettings) -> i32 {
+fn exec_check_file(
+    unwrapped_lines: impl Iterator<Item = OwningLine>,
+    settings: &GlobalSettings,
+) -> i32 {
     // errors yields the line before each disorder,
     // plus the last line (quirk of .coalesce())
     let mut errors = unwrapped_lines
@@ -1247,7 +1254,10 @@ fn exec_check_file(unwrapped_lines: impl Iterator<Item = Line>, settings: &Globa
     }
 }
 
-fn sort_by(unsorted: &mut Vec<Line>, settings: &GlobalSettings) {
+fn sort_by<'a, T>(unsorted: &mut Vec<Line<'a, T>>, settings: &GlobalSettings)
+where
+    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+{
     if settings.stable || settings.unique {
         unsorted.par_sort_by(|a, b| compare_by(a, b, &settings))
     } else {
@@ -1255,15 +1265,21 @@ fn sort_by(unsorted: &mut Vec<Line>, settings: &GlobalSettings) {
     }
 }
 
-fn compare_by(a: &Line, b: &Line, global_settings: &GlobalSettings) -> Ordering {
+fn compare_by<'a, T>(a: &Line<'a, T>, b: &Line<'a, T>, global_settings: &GlobalSettings) -> Ordering
+where
+    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+{
     for (idx, selector) in global_settings.selectors.iter().enumerate() {
         let (a_selection, b_selection) = if idx == 0 {
-            (&a.first_selection, &b.first_selection)
+            (a.borrow_first_selection(), b.borrow_first_selection())
         } else {
-            (&a.other_selections[idx - 1], &b.other_selections[idx - 1])
+            (
+                &a.borrow_other_selections()[idx - 1],
+                &b.borrow_other_selections()[idx - 1],
+            )
         };
-        let a_str = a_selection.get_str(a);
-        let b_str = b_selection.get_str(b);
+        let a_str = a_selection.range;
+        let b_str = b_selection.range;
         let settings = &selector.settings;
 
         let cmp: Ordering = if settings.random {
@@ -1298,7 +1314,7 @@ fn compare_by(a: &Line, b: &Line, global_settings: &GlobalSettings) -> Ordering 
     let cmp = if global_settings.random || global_settings.stable || global_settings.unique {
         Ordering::Equal
     } else {
-        a.line.cmp(&b.line)
+        a.borrow_original().cmp(b.borrow_original())
     };
 
     if global_settings.reverse {
@@ -1495,7 +1511,14 @@ fn version_compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn print_sorted<T: Iterator<Item = Line>>(iter: T, settings: &GlobalSettings) {
+fn print_sorted<
+    'a,
+    S: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+    T: Iterator<Item = Line<'a, S>>,
+>(
+    iter: T,
+    settings: &GlobalSettings,
+) {
     let mut file: Box<dyn Write> = match settings.outfile {
         Some(ref filename) => match File::create(Path::new(&filename)) {
             Ok(f) => Box::new(BufWriter::new(f)) as Box<dyn Write>,
@@ -1508,13 +1531,13 @@ fn print_sorted<T: Iterator<Item = Line>>(iter: T, settings: &GlobalSettings) {
     };
     if settings.zero_terminated && !settings.debug {
         for line in iter {
-            crash_if_err!(1, file.write_all(line.line.as_bytes()));
+            crash_if_err!(1, file.write_all(line.borrow_original().as_bytes()));
             crash_if_err!(1, file.write_all("\0".as_bytes()));
         }
     } else {
         for line in iter {
             if !settings.debug {
-                crash_if_err!(1, file.write_all(line.line.as_bytes()));
+                crash_if_err!(1, file.write_all(line.borrow_original().as_bytes()));
                 crash_if_err!(1, file.write_all("\n".as_bytes()));
             } else {
                 crash_if_err!(1, line.print_debug(settings, &mut file));
@@ -1622,7 +1645,8 @@ mod tests {
     fn test_line_size() {
         // We should make sure to not regress the size of the Line struct because
         // it is unconditional overhead for every line we sort.
-        assert_eq!(std::mem::size_of::<Line>(), 56);
+        assert_eq!(std::mem::size_of::<Line<&str>>(), 56);
+        assert_eq!(std::mem::size_of::<Line<Box<str>>>(), 56);
         // These are the fields of Line:
         assert_eq!(std::mem::size_of::<Box<str>>(), 16);
         assert_eq!(std::mem::size_of::<Selection>(), 24);

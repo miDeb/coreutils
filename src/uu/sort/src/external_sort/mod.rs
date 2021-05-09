@@ -4,9 +4,7 @@ use std::path::Path;
 
 use tempdir::TempDir;
 
-use crate::{file_to_lines_iter, FileMerger};
-
-use super::{GlobalSettings, Line};
+use crate::{file_to_lines_iter, FileMerger, GlobalSettings, OwningLine};
 
 /// Iterator that provides sorted `T`s
 pub struct ExtSortedIterator<'a> {
@@ -16,7 +14,7 @@ pub struct ExtSortedIterator<'a> {
 }
 
 impl<'a> Iterator for ExtSortedIterator<'a> {
-    type Item = Line;
+    type Item = OwningLine;
     fn next(&mut self) -> Option<Self::Item> {
         self.file_merger.next()
     }
@@ -30,7 +28,7 @@ impl<'a> Iterator for ExtSortedIterator<'a> {
 /// This method can panic due to issues writing intermediate sorted chunks
 /// to disk.
 pub fn ext_sort(
-    unsorted: impl Iterator<Item = Line>,
+    unsorted: impl Iterator<Item = OwningLine>,
     settings: &GlobalSettings,
 ) -> ExtSortedIterator {
     let tmp_dir = crash_if_err!(1, TempDir::new_in(&settings.tmp_dir, "uutils_sort"));
@@ -79,11 +77,11 @@ pub fn ext_sort(
     }
 }
 
-fn write_chunk(settings: &GlobalSettings, file: &Path, chunk: &mut Vec<Line>) {
+fn write_chunk(settings: &GlobalSettings, file: &Path, chunk: &mut Vec<OwningLine>) {
     let new_file = crash_if_err!(1, OpenOptions::new().create(true).append(true).open(file));
     let mut buf_write = BufWriter::new(new_file);
     for s in chunk {
-        crash_if_err!(1, buf_write.write_all(s.line.as_bytes()));
+        crash_if_err!(1, buf_write.write_all(s.borrow_original().as_bytes()));
         crash_if_err!(
             1,
             buf_write.write_all(if settings.zero_terminated { "\0" } else { "\n" }.as_bytes(),)
