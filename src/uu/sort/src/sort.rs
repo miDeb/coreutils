@@ -29,7 +29,6 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use semver::Version;
-use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::env;
 use std::ffi::OsStr;
@@ -40,6 +39,7 @@ use std::mem::replace;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::{cmp::Ordering, ops::Deref};
 use unicode_width::UnicodeWidthStr;
 use uucore::fs::is_stdin_interactive; // for Iterator::dedup()
 use uucore::InvalidEncodingHandling;
@@ -256,7 +256,7 @@ struct Selection {
 
 impl Selection {
     /// Gets the actual string slice represented by this Selection.
-    fn get_str<'a>(&'a self, line: &'a Line) -> &'a str {
+    fn get_str<'a, T: Deref<Target = str> + Send>(&'a self, line: &'a Line<T>) -> &'a str {
         self.range.get_str(&line.line)
     }
 }
@@ -264,14 +264,14 @@ impl Selection {
 type Field = Range<usize>;
 
 #[derive(Clone)]
-pub struct Line {
-    line: Box<str>,
+pub struct Line<T: Deref<Target = str> + Send> {
+    line: T,
     // The common case is not to specify fields. Let's make this fast.
     first_selection: Selection,
     other_selections: Box<[Selection]>,
 }
 
-impl Line {
+impl<T: Deref<Target = str> + Send> Line<T> {
     /// Estimate the number of bytes that this Line is occupying
     pub fn estimate_size(&self) -> usize {
         self.line.len()
@@ -279,7 +279,7 @@ impl Line {
             + std::mem::size_of::<Self>()
     }
 
-    pub fn new(line: String, settings: &GlobalSettings) -> Self {
+    pub fn new(line: T, settings: &GlobalSettings) -> Self {
         let fields = if settings
             .selectors
             .iter()
@@ -303,7 +303,7 @@ impl Line {
             .collect();
 
         Self {
-            line: line.into_boxed_str(),
+            line,
             first_selection,
             other_selections: other_selections.into_boxed_slice(),
         }
@@ -702,8 +702,8 @@ impl FieldSelector {
 }
 
 struct MergeableFile<'a> {
-    lines: Box<dyn Iterator<Item = Line> + 'a>,
-    current_line: Line,
+    lines: Box<dyn Iterator<Item = Line<Box<str>>> + 'a>,
+    current_line: Line<Box<str>>,
     settings: &'a GlobalSettings,
 }
 
@@ -742,7 +742,7 @@ impl<'a> FileMerger<'a> {
             settings,
         }
     }
-    fn push_file(&mut self, mut lines: Box<dyn Iterator<Item = Line> + 'a>) {
+    fn push_file(&mut self, mut lines: Box<dyn Iterator<Item = Line<Box<str>>> + 'a>) {
         if let Some(next_line) = lines.next() {
             let mergeable_file = MergeableFile {
                 lines,
@@ -755,8 +755,8 @@ impl<'a> FileMerger<'a> {
 }
 
 impl<'a> Iterator for FileMerger<'a> {
-    type Item = Line;
-    fn next(&mut self) -> Option<Line> {
+    type Item = Line<Box<str>>;
+    fn next(&mut self) -> Option<Line<Box<str>>> {
         match self.heap.pop() {
             Some(mut current) => {
                 match current.lines.next() {
@@ -1132,7 +1132,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 fn file_to_lines_iter(
     file: impl AsRef<OsStr>,
     settings: &'_ GlobalSettings,
-) -> Option<impl Iterator<Item = Line> + '_> {
+) -> Option<impl Iterator<Item = Line<Box<str>>> + '_> {
     let (reader, _) = match open(file) {
         Some(x) => x,
         None => return None,
@@ -1149,14 +1149,17 @@ fn file_to_lines_iter(
             })
             .map(move |line| {
                 Line::new(
-                    crash_if_err!(1, String::from_utf8(crash_if_err!(1, line))),
+                    crash_if_err!(1, String::from_utf8(crash_if_err!(1, line))).into_boxed_str(),
                     settings,
                 )
             }),
     )
 }
 
-fn output_sorted_lines(iter: impl Iterator<Item = Line>, settings: &GlobalSettings) {
+fn output_sorted_lines<T: Deref<Target = str> + Send>(
+    iter: impl Iterator<Item = Line<T>>,
+    settings: &GlobalSettings,
+) {
     if settings.unique {
         print_sorted(
             iter.dedup_by(|a, b| compare_by(a, b, &settings) == Ordering::Equal),
@@ -1194,20 +1197,25 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
             let sorted_lines = ext_sort(lines, &settings);
             output_sorted_lines(sorted_lines, &settings);
         } else {
-            let mut lines = vec![];
+            let mut buffer = String::new();
+
+            let separator = if settings.zero_terminated { '\0' } else { '\n' };
 
             // This is duplicated from fn file_to_lines_iter, but using that function directly results in a performance regression.
-            for (file, _) in files.iter().map(open).flatten() {
-                let buf_reader = BufReader::new(file);
-                for line in buf_reader.split(if settings.zero_terminated {
-                    b'\0'
-                } else {
-                    b'\n'
-                }) {
-                    let string = crash_if_err!(1, String::from_utf8(crash_if_err!(1, line)));
-                    lines.push(Line::new(string, &settings));
+            for (mut file, _) in files.iter().map(open).flatten() {
+                crash_if_err!(1, file.read_to_string(&mut buffer));
+                if !buffer.ends_with(separator) {
+                    buffer.push(separator);
                 }
             }
+            if buffer.ends_with(separator) {
+                buffer.pop();
+            }
+
+            let mut lines = buffer
+                .split(separator)
+                .map(|line| Line::new(line, &settings))
+                .collect();
 
             sort_by(&mut lines, &settings);
             output_sorted_lines(lines.into_iter(), &settings);
@@ -1217,7 +1225,10 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
     0
 }
 
-fn exec_check_file(unwrapped_lines: impl Iterator<Item = Line>, settings: &GlobalSettings) -> i32 {
+fn exec_check_file(
+    unwrapped_lines: impl Iterator<Item = Line<Box<str>>>,
+    settings: &GlobalSettings,
+) -> i32 {
     // errors yields the line before each disorder,
     // plus the last line (quirk of .coalesce())
     let mut errors = unwrapped_lines
@@ -1247,7 +1258,7 @@ fn exec_check_file(unwrapped_lines: impl Iterator<Item = Line>, settings: &Globa
     }
 }
 
-fn sort_by(unsorted: &mut Vec<Line>, settings: &GlobalSettings) {
+fn sort_by<T: Deref<Target = str> + Send>(unsorted: &mut Vec<Line<T>>, settings: &GlobalSettings) {
     if settings.stable || settings.unique {
         unsorted.par_sort_by(|a, b| compare_by(a, b, &settings))
     } else {
@@ -1255,7 +1266,11 @@ fn sort_by(unsorted: &mut Vec<Line>, settings: &GlobalSettings) {
     }
 }
 
-fn compare_by(a: &Line, b: &Line, global_settings: &GlobalSettings) -> Ordering {
+fn compare_by<T: Deref<Target = str> + Send>(
+    a: &Line<T>,
+    b: &Line<T>,
+    global_settings: &GlobalSettings,
+) -> Ordering {
     for (idx, selector) in global_settings.selectors.iter().enumerate() {
         let (a_selection, b_selection) = if idx == 0 {
             (&a.first_selection, &b.first_selection)
@@ -1495,7 +1510,11 @@ fn version_compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn print_sorted<T: Iterator<Item = Line>>(iter: T, settings: &GlobalSettings) {
+fn print_sorted<S, T>(iter: T, settings: &GlobalSettings)
+where
+    S: Deref<Target = str> + Send,
+    T: Iterator<Item = Line<S>>,
+{
     let mut file: Box<dyn Write> = match settings.outfile {
         Some(ref filename) => match File::create(Path::new(&filename)) {
             Ok(f) => Box::new(BufWriter::new(f)) as Box<dyn Write>,
@@ -1622,7 +1641,8 @@ mod tests {
     fn test_line_size() {
         // We should make sure to not regress the size of the Line struct because
         // it is unconditional overhead for every line we sort.
-        assert_eq!(std::mem::size_of::<Line>(), 56);
+        assert_eq!(std::mem::size_of::<Line<&str>>(), 56);
+        assert_eq!(std::mem::size_of::<Line<Box<str>>>(), 56);
         // These are the fields of Line:
         assert_eq!(std::mem::size_of::<Box<str>>(), 16);
         assert_eq!(std::mem::size_of::<Selection>(), 24);

@@ -16,7 +16,7 @@ pub struct ExtSortedIterator<'a> {
 }
 
 impl<'a> Iterator for ExtSortedIterator<'a> {
-    type Item = Line;
+    type Item = Line<Box<str>>;
     fn next(&mut self) -> Option<Self::Item> {
         self.file_merger.next()
     }
@@ -30,7 +30,7 @@ impl<'a> Iterator for ExtSortedIterator<'a> {
 /// This method can panic due to issues writing intermediate sorted chunks
 /// to disk.
 pub fn ext_sort(
-    unsorted: impl Iterator<Item = Line>,
+    unsorted: impl Iterator<Item = Line<Box<str>>>,
     settings: &GlobalSettings,
 ) -> ExtSortedIterator {
     let tmp_dir = crash_if_err!(1, TempDir::new_in(&settings.tmp_dir, "uutils_sort"));
@@ -79,7 +79,7 @@ pub fn ext_sort(
     }
 }
 
-fn write_chunk(settings: &GlobalSettings, file: &Path, chunk: &mut Vec<Line>) {
+fn write_chunk(settings: &GlobalSettings, file: &Path, chunk: &mut Vec<Line<Box<str>>>) {
     let new_file = crash_if_err!(1, OpenOptions::new().create(true).append(true).open(file));
     let mut buf_write = BufWriter::new(new_file);
     for s in chunk {
