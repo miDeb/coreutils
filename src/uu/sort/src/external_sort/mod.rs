@@ -81,7 +81,7 @@ fn write_chunk(settings: &GlobalSettings, file: &Path, chunk: &mut Vec<OwningLin
     let new_file = crash_if_err!(1, OpenOptions::new().create(true).append(true).open(file));
     let mut buf_write = BufWriter::new(new_file);
     for s in chunk {
-        crash_if_err!(1, buf_write.write_all(s.borrow_original().as_bytes()));
+        crash_if_err!(1, buf_write.write_all(s.borrow_line().as_bytes()));
         crash_if_err!(
             1,
             buf_write.write_all(if settings.zero_terminated { "\0" } else { "\n" }.as_bytes(),)

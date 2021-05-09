@@ -231,25 +231,30 @@ impl NumCache {
 
 #[derive(Clone)]
 struct Selection<'a> {
-    range: &'a str,
+    slice: &'a str,
     num_cache: Option<Box<NumCache>>,
 }
 
 type Field = Range<usize>;
 
+pub trait PossibleLine: Deref<Target = str> + stable_deref_trait::StableDeref + Send {}
+
+impl PossibleLine for Box<str> {}
+impl<'a> PossibleLine for &'a str {}
+
 #[self_referencing]
 #[derive(Clone)]
 pub struct Line<'a, T>
 where
-    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+    T: PossibleLine + 'a,
 {
-    original: T,
+    line: T,
     // The common case is not to specify fields. Let's make this fast.
-    #[borrows(original)]
     #[covariant]
+    #[borrows(line)]
     first_selection: Selection<'this>,
-    #[borrows(original)]
     #[covariant]
+    #[borrows(line)]
     other_selections: Box<[Selection<'this>]>,
     #[covariant]
     p: PhantomData<&'a str>,
@@ -257,15 +262,9 @@ where
 
 type OwningLine = Line<'static, Box<str>>;
 
-// SAFETY: Sending a Line struct is safe, but due to what ouroboros internally does to it it's no longer automatically inferred.
-unsafe impl<'a, T> Send for Line<'a, T> where
-    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref
-{
-}
-
 impl OwningLine {
     fn estimate_size(&self) -> usize {
-        self.borrow_original().len()
+        self.borrow_line().len()
             + self.borrow_other_selections().len() * std::mem::size_of::<Selection>()
             + std::mem::size_of::<Self>()
     }
@@ -273,7 +272,7 @@ impl OwningLine {
 
 impl<'a, T> Line<'a, T>
 where
-    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+    T: PossibleLine + 'a,
 {
     fn create(string: T, settings: &GlobalSettings) -> Self {
         let fields = if settings
@@ -288,7 +287,7 @@ where
         };
 
         LineBuilder {
-            original: string,
+            line: string,
             first_selection_builder: |original| {
                 settings
                     .selectors
@@ -320,17 +319,17 @@ where
         // which are not a performance problem in any case. Therefore there aren't any special performance
         // optimizations here.
 
-        let line = self.borrow_original().replace('\t', ">");
+        let line = self.borrow_line().replace('\t', ">");
         writeln!(writer, "{}", line)?;
 
-        let fields = tokenize(&self.borrow_original(), settings.separator);
+        let fields = tokenize(&self.borrow_line(), settings.separator);
         for selector in settings.selectors.iter() {
-            let mut selection = selector.get_range(&self.borrow_original(), Some(&fields));
+            let mut selection = selector.get_range(&self.borrow_line(), Some(&fields));
             match selector.settings.mode {
                 SortMode::Numeric | SortMode::HumanNumeric => {
                     // find out which range is used for numeric comparisons
                     let (_, num_range) = NumInfo::parse(
-                        &self.borrow_original()[selection.clone()],
+                        &self.borrow_line()[selection.clone()],
                         NumInfoParseSettings {
                             accept_si_units: selector.settings.mode == SortMode::HumanNumeric,
                             thousands_separator: Some(THOUSANDS_SEP),
@@ -345,21 +344,21 @@ where
 
                     // include a trailing si unit
                     if selector.settings.mode == SortMode::HumanNumeric
-                        && self.borrow_original()[selection.end..initial_selection.end]
+                        && self.borrow_line()[selection.end..initial_selection.end]
                             .starts_with(&['k', 'K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'][..])
                     {
                         selection.end += 1;
                     }
 
                     // include leading zeroes, a leading minus or a leading decimal point
-                    while self.borrow_original()[initial_selection.start..selection.start]
+                    while self.borrow_line()[initial_selection.start..selection.start]
                         .ends_with(&['-', '0', '.'][..])
                     {
                         selection.start -= 1;
                     }
                 }
                 SortMode::GeneralNumeric => {
-                    let initial_selection = &self.borrow_original()[selection.clone()];
+                    let initial_selection = &self.borrow_line()[selection.clone()];
 
                     let leading = get_leading_gen(initial_selection);
 
@@ -368,7 +367,7 @@ where
                     selection.end = selection.start + leading.len();
                 }
                 SortMode::Month => {
-                    let initial_selection = &self.borrow_original()[selection.clone()];
+                    let initial_selection = &self.borrow_line()[selection.clone()];
 
                     let month = if month_parse(initial_selection) == Month::Unknown {
                         // We failed to parse a month, which is equivalent to matching nothing.
@@ -419,7 +418,7 @@ where
                 || settings.mode != SortMode::Default))
         {
             // A last resort comparator is in use, underline the whole line.
-            if self.borrow_original().is_empty() {
+            if self.borrow_line().is_empty() {
                 writeln!(writer, "^ no match for key")?;
             } else {
                 writeln!(
@@ -610,7 +609,10 @@ impl FieldSelector {
             // This is not a numeric sort, so we don't need a NumCache.
             None
         };
-        Selection { range, num_cache }
+        Selection {
+            slice: range,
+            num_cache,
+        }
     }
 
     /// Look up the range in the line that corresponds to this selector.
@@ -1155,7 +1157,7 @@ fn file_to_lines_iter(
     )
 }
 
-fn output_sorted_lines<'a, T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref>(
+fn output_sorted_lines<'a, T: PossibleLine + 'a>(
     iter: impl Iterator<Item = Line<'a, T>>,
     settings: &GlobalSettings,
 ) {
@@ -1256,7 +1258,7 @@ fn exec_check_file(
 
 fn sort_by<'a, T>(unsorted: &mut Vec<Line<'a, T>>, settings: &GlobalSettings)
 where
-    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+    T: PossibleLine + 'a,
 {
     if settings.stable || settings.unique {
         unsorted.par_sort_by(|a, b| compare_by(a, b, &settings))
@@ -1267,7 +1269,7 @@ where
 
 fn compare_by<'a, T>(a: &Line<'a, T>, b: &Line<'a, T>, global_settings: &GlobalSettings) -> Ordering
 where
-    T: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
+    T: PossibleLine + 'a,
 {
     for (idx, selector) in global_settings.selectors.iter().enumerate() {
         let (a_selection, b_selection) = if idx == 0 {
@@ -1278,8 +1280,8 @@ where
                 &b.borrow_other_selections()[idx - 1],
             )
         };
-        let a_str = a_selection.range;
-        let b_str = b_selection.range;
+        let a_str = a_selection.slice;
+        let b_str = b_selection.slice;
         let settings = &selector.settings;
 
         let cmp: Ordering = if settings.random {
@@ -1314,7 +1316,7 @@ where
     let cmp = if global_settings.random || global_settings.stable || global_settings.unique {
         Ordering::Equal
     } else {
-        a.borrow_original().cmp(b.borrow_original())
+        a.borrow_line().cmp(b.borrow_line())
     };
 
     if global_settings.reverse {
@@ -1511,11 +1513,7 @@ fn version_compare(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn print_sorted<
-    'a,
-    S: 'a + Deref<Target = str> + stable_deref_trait::StableDeref,
-    T: Iterator<Item = Line<'a, S>>,
->(
+fn print_sorted<'a, S: PossibleLine + 'a, T: Iterator<Item = Line<'a, S>>>(
     iter: T,
     settings: &GlobalSettings,
 ) {
@@ -1531,13 +1529,13 @@ fn print_sorted<
     };
     if settings.zero_terminated && !settings.debug {
         for line in iter {
-            crash_if_err!(1, file.write_all(line.borrow_original().as_bytes()));
+            crash_if_err!(1, file.write_all(line.borrow_line().as_bytes()));
             crash_if_err!(1, file.write_all("\0".as_bytes()));
         }
     } else {
         for line in iter {
             if !settings.debug {
-                crash_if_err!(1, file.write_all(line.borrow_original().as_bytes()));
+                crash_if_err!(1, file.write_all(line.borrow_line().as_bytes()));
                 crash_if_err!(1, file.write_all("\n".as_bytes()));
             } else {
                 crash_if_err!(1, line.print_debug(settings, &mut file));
