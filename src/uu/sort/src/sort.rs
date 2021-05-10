@@ -21,7 +21,7 @@ mod numeric_str_cmp;
 
 use clap::{App, Arg};
 use custom_str_cmp::custom_str_cmp;
-use external_sort::ext_sort;
+use external_sort::{ext_sort, rewrite};
 use fnv::FnvHasher;
 use itertools::Itertools;
 use numeric_str_cmp::{numeric_str_cmp, NumInfo, NumInfoParseSettings};
@@ -758,23 +758,13 @@ impl<'a> FileMerger<'a> {
 impl<'a> Iterator for FileMerger<'a> {
     type Item = OwningLine;
     fn next(&mut self) -> Option<OwningLine> {
-        match self.heap.pop() {
-            Some(mut current) => {
-                match current.lines.next() {
-                    Some(next_line) => {
-                        let ret = replace(&mut current.current_line, next_line);
-                        self.heap.push(current);
-                        Some(ret)
-                    }
-                    _ => {
-                        // Don't put it back in the heap (it's empty/erroring)
-                        // but its first line is still valid.
-                        Some(current.current_line)
-                    }
-                }
+        if let Some(mut current) = self.heap.peek_mut() {
+            if let Some(next_line) = current.lines.next() {
+                let ret = replace(&mut current.current_line, next_line);
+                return Some(ret);
             }
-            None => None,
         }
+        self.heap.pop().map(|file| file.current_line)
     }
 }
 
@@ -977,7 +967,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
 
         let mut files = Vec::new();
         for path in &files0_from {
-            let (reader, _) = open(path.as_str()).expect("Could not read from file specified.");
+            let reader = open(path.as_str()).expect("Could not read from file specified.");
             let buf_reader = BufReader::new(reader);
             for line in buf_reader.split(b'\0').flatten() {
                 files.push(
@@ -1134,7 +1124,7 @@ fn file_to_lines_iter(
     file: impl AsRef<OsStr>,
     settings: &'_ GlobalSettings,
 ) -> Option<impl Iterator<Item = OwningLine> + '_> {
-    let (reader, _) = match open(file) {
+    let reader = match open(file) {
         Some(x) => x,
         None => return None,
     };
@@ -1189,19 +1179,16 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
 
         return exec_check_file(lines, &settings);
     } else if settings.ext_sort {
-        let lines = files
-            .iter()
-            .filter_map(|file| file_to_lines_iter(file, &settings))
-            .flatten();
+        let mut lines = files.iter().filter_map(open);
 
-        let sorted = ext_sort(lines, &settings);
+        let sorted = rewrite::ext_sort(&mut lines, &settings);
         output_sorted_lines(sorted, &settings);
     } else {
         let separator = if settings.zero_terminated { '\0' } else { '\n' };
         let mut lines = vec![];
         let mut full_string = String::new();
 
-        for (mut file, _) in files.iter().map(open).flatten() {
+        for mut file in files.iter().map(open).flatten() {
             crash_if_err!(1, file.read_to_string(&mut full_string));
 
             if !full_string.ends_with(separator) {
@@ -1546,15 +1533,15 @@ fn print_sorted<'a, S: PossibleLine + 'a, T: Iterator<Item = Line<'a, S>>>(
 }
 
 // from cat.rs
-fn open(path: impl AsRef<OsStr>) -> Option<(Box<dyn Read>, bool)> {
+fn open(path: impl AsRef<OsStr>) -> Option<Box<dyn Read>> {
     let path = path.as_ref();
     if path == "-" {
         let stdin = stdin();
-        return Some((Box::new(stdin) as Box<dyn Read>, is_stdin_interactive()));
+        return Some(Box::new(stdin) as Box<dyn Read>);
     }
 
     match File::open(Path::new(path)) {
-        Ok(f) => Some((Box::new(f) as Box<dyn Read>, false)),
+        Ok(f) => Some(Box::new(f) as Box<dyn Read>),
         Err(e) => {
             show_error!("{0:?}: {1}", path, e.to_string());
             None

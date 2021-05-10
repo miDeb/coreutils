@@ -27,6 +27,7 @@ uucore_procs = { version=">=0.0.5", package="uucore_procs", path="../../uucore_p
 tempdir = "0.3.7"
 ouroboros = "0.9.2"
 stable_deref_trait = "1.2.0"
+memchr = "2.4.0"
 
 [[bin]]
 name = "sort"
