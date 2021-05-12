@@ -249,13 +249,9 @@ where
     T: PossibleLine + 'a,
 {
     line: T,
-    // The common case is not to specify fields. Let's make this fast.
     #[covariant]
     #[borrows(line)]
-    first_selection: Selection<'this>,
-    #[covariant]
-    #[borrows(line)]
-    other_selections: Box<[Selection<'this>]>,
+    selections: Box<[Selection<'this>]>,
     #[covariant]
     p: PhantomData<&'a str>,
 }
@@ -265,7 +261,7 @@ type OwningLine = Line<'static, Box<str>>;
 impl OwningLine {
     fn estimate_size(&self) -> usize {
         self.borrow_line().len()
-            + self.borrow_other_selections().len() * std::mem::size_of::<Selection>()
+            + self.borrow_selections().len() * std::mem::size_of::<Selection>()
             + std::mem::size_of::<Self>()
     }
 }
@@ -278,7 +274,7 @@ where
         let fields = if settings
             .selectors
             .iter()
-            .any(|selector| selector.needs_tokens())
+            .any(|selector| selector.needs_tokens)
         {
             // Only tokenize if we will need tokens.
             Some(tokenize(string.as_ref(), settings.separator))
@@ -288,18 +284,11 @@ where
 
         LineBuilder {
             line: string,
-            first_selection_builder: |original| {
-                settings
-                    .selectors
-                    .first()
-                    .unwrap()
-                    .get_selection(original, fields.as_deref())
-            },
-            other_selections_builder: |original| {
+            selections_builder: |original| {
                 settings
                     .selectors
                     .iter()
-                    .skip(1)
+                    .filter(|selector| !selector.is_full_range)
                     .map(|selector| selector.get_selection(original, fields.as_deref()))
                     .collect()
             },
@@ -574,11 +563,25 @@ struct FieldSelector {
     from: KeyPosition,
     to: Option<KeyPosition>,
     settings: KeySettings,
+    needs_tokens: bool,
+    is_full_range: bool,
 }
 
 impl FieldSelector {
-    fn needs_tokens(&self) -> bool {
-        self.from.field != 1 || self.from.char == 0 || self.to.is_some()
+    fn new(from: KeyPosition, to: Option<KeyPosition>, settings: KeySettings) -> Self {
+        Self {
+            is_full_range: from.field == 1
+                && from.char == 1
+                && to.is_none()
+                && !matches!(
+                    settings.mode,
+                    SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric
+                ),
+            needs_tokens: from.field != 1 || from.char == 0 || to.is_some(),
+            from,
+            to,
+            settings,
+        }
     }
 
     /// Get the selection that corresponds to this selector for the line.
@@ -1094,11 +1097,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             let to = from_to
                 .next()
                 .map(|to| KeyPosition::parse(to, 0, &mut key_settings));
-            let field_selector = FieldSelector {
-                from,
-                to,
-                settings: key_settings,
-            };
+            let field_selector = FieldSelector::new(from, to, key_settings);
             settings.selectors.push(field_selector);
         }
     }
@@ -1106,15 +1105,15 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     if !settings.stable || !matches.is_present(OPT_KEY) {
         // add a default selector matching the whole line
         let key_settings = KeySettings::from(&settings);
-        settings.selectors.push(FieldSelector {
-            from: KeyPosition {
+        settings.selectors.push(FieldSelector::new(
+            KeyPosition {
                 field: 1,
                 char: 1,
                 ignore_blanks: key_settings.ignore_blanks,
             },
-            to: None,
-            settings: key_settings,
-        });
+            None,
+            key_settings,
+        ));
     }
 
     exec(files, settings)
@@ -1181,7 +1180,7 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
     } else if settings.ext_sort {
         let mut lines = files.iter().filter_map(open);
 
-        let sorted = rewrite::ext_sort(&mut lines, &settings);
+        let sorted = rewrite::r2::ext_sort(&mut lines, &settings);
         output_sorted_lines(sorted, &settings);
     } else {
         let separator = if settings.zero_terminated { '\0' } else { '\n' };
@@ -1258,14 +1257,31 @@ fn compare_by<'a, T>(a: &Line<'a, T>, b: &Line<'a, T>, global_settings: &GlobalS
 where
     T: PossibleLine + 'a,
 {
-    for (idx, selector) in global_settings.selectors.iter().enumerate() {
-        let (a_selection, b_selection) = if idx == 0 {
-            (a.borrow_first_selection(), b.borrow_first_selection())
-        } else {
+    let mut idx = 0;
+    for selector in global_settings.selectors.iter() {
+        let mut _selections = None;
+        let (a_selection, b_selection) = if selector.is_full_range {
+            _selections = Some((
+                Selection {
+                    slice: a.borrow_line().as_ref(),
+                    num_cache: None,
+                },
+                Selection {
+                    slice: b.borrow_line().as_ref(),
+                    num_cache: None,
+                },
+            ));
             (
-                &a.borrow_other_selections()[idx - 1],
-                &b.borrow_other_selections()[idx - 1],
+                &_selections.as_ref().unwrap().0,
+                &_selections.as_ref().unwrap().1,
             )
+        } else {
+            let selections = (
+                &a.borrow_selections()[idx],
+                &b.borrow_selections()[idx],
+            );
+            idx += 1;
+            selections
         };
         let a_str = a_selection.slice;
         let b_str = b_selection.slice;
@@ -1630,11 +1646,14 @@ mod tests {
     fn test_line_size() {
         // We should make sure to not regress the size of the Line struct because
         // it is unconditional overhead for every line we sort.
-        assert_eq!(std::mem::size_of::<Line<&str>>(), 56);
-        assert_eq!(std::mem::size_of::<Line<Box<str>>>(), 56);
+        assert_eq!(std::mem::size_of::<Line<&str>>(), 32);
+        assert_eq!(std::mem::size_of::<Line<Box<str>>>(), 32);
         // These are the fields of Line:
         assert_eq!(std::mem::size_of::<Box<str>>(), 16);
-        assert_eq!(std::mem::size_of::<Selection>(), 24);
+        assert_eq!(std::mem::size_of::<&str>(), 16);
         assert_eq!(std::mem::size_of::<Box<[Selection]>>(), 16);
+
+        // How big is a selection? Constant cost all lines pay when we need selections
+        assert_eq!(std::mem::size_of::<Selection>(), 24);
     }
 }
