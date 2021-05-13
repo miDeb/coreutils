@@ -16,12 +16,12 @@
 extern crate uucore;
 
 mod custom_str_cmp;
-mod external_sort;
+mod ext_sort;
 mod numeric_str_cmp;
 
 use clap::{App, Arg};
 use custom_str_cmp::custom_str_cmp;
-use external_sort::{ext_sort, rewrite};
+use ext_sort::ext_sort;
 use fnv::FnvHasher;
 use itertools::Itertools;
 use numeric_str_cmp::{numeric_str_cmp, NumInfo, NumInfoParseSettings};
@@ -44,7 +44,6 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
-use uucore::fs::is_stdin_interactive; // for Iterator::dedup()
 use uucore::InvalidEncodingHandling;
 
 static NAME: &str = "sort";
@@ -257,14 +256,7 @@ where
 }
 
 type OwningLine = Line<'static, Box<str>>;
-
-impl OwningLine {
-    fn estimate_size(&self) -> usize {
-        self.borrow_line().len()
-            + self.borrow_selections().len() * std::mem::size_of::<Selection>()
-            + std::mem::size_of::<Self>()
-    }
-}
+type BorrowedLine<'a> = Line<'a, &'a str>;
 
 impl<'a, T> Line<'a, T>
 where
@@ -1116,7 +1108,7 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         ));
     }
 
-    exec(files, settings)
+    exec(&files, &settings)
 }
 
 fn file_to_lines_iter(
@@ -1160,7 +1152,7 @@ fn output_sorted_lines<'a, T: PossibleLine + 'a>(
     }
 }
 
-fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
+fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
     if settings.merge {
         let mut file_merger = FileMerger::new(&settings);
         for lines in files
@@ -1180,14 +1172,14 @@ fn exec(files: Vec<String>, settings: GlobalSettings) -> i32 {
     } else if settings.ext_sort {
         let mut lines = files.iter().filter_map(open);
 
-        let sorted = rewrite::r2::ext_sort(&mut lines, &settings);
+        let sorted = ext_sort(&mut lines, &settings);
         output_sorted_lines(sorted, &settings);
     } else {
         let separator = if settings.zero_terminated { '\0' } else { '\n' };
         let mut lines = vec![];
         let mut full_string = String::new();
 
-        for mut file in files.iter().map(open).flatten() {
+        for mut file in files.iter().filter_map(open) {
             crash_if_err!(1, file.read_to_string(&mut full_string));
 
             if !full_string.ends_with(separator) {
@@ -1258,7 +1250,7 @@ where
     T: PossibleLine + 'a,
 {
     let mut idx = 0;
-    for selector in global_settings.selectors.iter() {
+    for selector in &global_settings.selectors {
         let mut _selections = None;
         let (a_selection, b_selection) = if selector.is_full_range {
             _selections = Some((
@@ -1276,10 +1268,7 @@ where
                 &_selections.as_ref().unwrap().1,
             )
         } else {
-            let selections = (
-                &a.borrow_selections()[idx],
-                &b.borrow_selections()[idx],
-            );
+            let selections = (&a.borrow_selections()[idx], &b.borrow_selections()[idx]);
             idx += 1;
             selections
         };
@@ -1288,7 +1277,7 @@ where
         let settings = &selector.settings;
 
         let cmp: Ordering = if settings.random {
-            random_shuffle(a_str, b_str, global_settings.salt.clone())
+            random_shuffle(a_str, b_str, &global_settings.salt)
         } else {
             match settings.mode {
                 SortMode::Numeric | SortMode::HumanNumeric => numeric_str_cmp(
@@ -1420,12 +1409,11 @@ fn get_hash<T: Hash>(t: &T) -> u64 {
     s.finish()
 }
 
-fn random_shuffle(a: &str, b: &str, x: String) -> Ordering {
+fn random_shuffle(a: &str, b: &str, salt: &str) -> Ordering {
     #![allow(clippy::comparison_chain)]
-    let salt_slice = x.as_str();
 
-    let da = get_hash(&[a, salt_slice].concat());
-    let db = get_hash(&[b, salt_slice].concat());
+    let da = get_hash(&[a, salt].concat());
+    let db = get_hash(&[b, salt].concat());
 
     da.cmp(&db)
 }
@@ -1583,7 +1571,7 @@ mod tests {
         let b = "Ted";
         let c = get_rand_string();
 
-        assert_eq!(Ordering::Equal, random_shuffle(a, b, c));
+        assert_eq!(Ordering::Equal, random_shuffle(a, b, &c));
     }
 
     #[test]
@@ -1607,7 +1595,7 @@ mod tests {
         let b = "9";
         let c = get_rand_string();
 
-        assert_eq!(Ordering::Equal, random_shuffle(a, b, c));
+        assert_eq!(Ordering::Equal, random_shuffle(a, b, &c));
     }
 
     #[test]
