@@ -17,8 +17,8 @@ extern crate uucore;
 
 mod custom_str_cmp;
 mod ext_sort;
-mod numeric_str_cmp;
 mod file_merger;
+mod numeric_str_cmp;
 
 use clap::{App, Arg};
 use custom_str_cmp::custom_str_cmp;
@@ -32,20 +32,23 @@ use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use semver::Version;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
-use std::mem::replace;
 use std::ops::Deref;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 use uucore::InvalidEncodingHandling;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 static NAME: &str = "sort";
 static ABOUT: &str = "Display sorted concatenation of all FILE(s).";
@@ -698,72 +701,6 @@ impl FieldSelector {
     }
 }
 
-struct MergeableFile<'a> {
-    lines: Box<dyn Iterator<Item = OwningLine> + 'a>,
-    current_line: OwningLine,
-    settings: &'a GlobalSettings,
-}
-
-// BinaryHeap depends on `Ord`. Note that we want to pop smallest items
-// from the heap first, and BinaryHeap.pop() returns the largest, so we
-// trick it into the right order by calling reverse() here.
-impl<'a> Ord for MergeableFile<'a> {
-    fn cmp(&self, other: &MergeableFile) -> Ordering {
-        compare_by(&self.current_line, &other.current_line, self.settings).reverse()
-    }
-}
-
-impl<'a> PartialOrd for MergeableFile<'a> {
-    fn partial_cmp(&self, other: &MergeableFile) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<'a> PartialEq for MergeableFile<'a> {
-    fn eq(&self, other: &MergeableFile) -> bool {
-        Ordering::Equal == self.cmp(other)
-    }
-}
-
-impl<'a> Eq for MergeableFile<'a> {}
-
-struct FileMerger<'a> {
-    heap: BinaryHeap<MergeableFile<'a>>,
-    settings: &'a GlobalSettings,
-}
-
-impl<'a> FileMerger<'a> {
-    fn new(settings: &'a GlobalSettings) -> FileMerger<'a> {
-        FileMerger {
-            heap: BinaryHeap::new(),
-            settings,
-        }
-    }
-    fn push_file(&mut self, mut lines: Box<dyn Iterator<Item = OwningLine> + 'a>) {
-        if let Some(next_line) = lines.next() {
-            let mergeable_file = MergeableFile {
-                lines,
-                current_line: next_line,
-                settings: &self.settings,
-            };
-            self.heap.push(mergeable_file);
-        }
-    }
-}
-
-impl<'a> Iterator for FileMerger<'a> {
-    type Item = OwningLine;
-    fn next(&mut self) -> Option<OwningLine> {
-        if let Some(mut current) = self.heap.peek_mut() {
-            if let Some(next_line) = current.lines.next() {
-                let ret = replace(&mut current.current_line, next_line);
-                return Some(ret);
-            }
-        }
-        self.heap.pop().map(|file| file.current_line)
-    }
-}
-
 fn get_usage() -> String {
     format!(
         "{0} {1}
@@ -1155,13 +1092,8 @@ fn output_sorted_lines<'a, T: PossibleLine + 'a>(
 
 fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
     if settings.merge {
-        let mut file_merger = FileMerger::new(&settings);
-        for lines in files
-            .iter()
-            .filter_map(|file| file_to_lines_iter(file, &settings))
-        {
-            file_merger.push_file(Box::new(lines));
-        }
+        let file_merger = file_merger::merge(files, settings);
+
         output_sorted_lines(file_merger, &settings);
     } else if settings.check {
         let lines = files
@@ -1171,7 +1103,10 @@ fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
 
         return exec_check_file(lines, &settings);
     } else if settings.ext_sort {
-        let mut lines = files.iter().filter_map(open);
+        let mut lines = files
+            .iter()
+            .filter_map(open)
+            .map(|file| file as Box<dyn Read>);
 
         let sorted = ext_sort(&mut lines, &settings);
         output_sorted_lines(sorted, &settings);
@@ -1275,6 +1210,7 @@ where
         };
         let a_str = a_selection.slice;
         let b_str = b_selection.slice;
+        //print!("comparing {} with {}: ", a_str, b_str);
         let settings = &selector.settings;
 
         let cmp: Ordering = if settings.random {
@@ -1301,6 +1237,7 @@ where
             }
         };
         if cmp != Ordering::Equal {
+            //println!("{:?}", cmp);
             return if settings.reverse { cmp.reverse() } else { cmp };
         }
     }
@@ -1538,15 +1475,15 @@ fn print_sorted<'a, S: PossibleLine + 'a, T: Iterator<Item = Line<'a, S>>>(
 }
 
 // from cat.rs
-fn open(path: impl AsRef<OsStr>) -> Option<Box<dyn Read>> {
+fn open(path: impl AsRef<OsStr>) -> Option<Box<dyn Read + Send>> {
     let path = path.as_ref();
     if path == "-" {
         let stdin = stdin();
-        return Some(Box::new(stdin) as Box<dyn Read>);
+        return Some(Box::new(stdin) as Box<dyn Read + Send>);
     }
 
     match File::open(Path::new(path)) {
-        Ok(f) => Some(Box::new(f) as Box<dyn Read>),
+        Ok(f) => Some(Box::new(f) as Box<dyn Read + Send>),
         Err(e) => {
             show_error!("{0:?}: {1}", path, e.to_string());
             None

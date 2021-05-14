@@ -836,6 +836,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ccac4b00700875e6a07c6cde370d44d32fa01c5a65cdd2fca6858c479d28bb3"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2396cf99d2f58611cd69f0efeee4af3d2e2c7b61bed433515029163aa567e65c"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "locale"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -902,6 +911,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83fb6581e8ed1f85fd45c116db8405483899489e38406156c25eb743554361d"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e7c6b11afd1e5e689ac96b6d18b1fc763398fe3d7eed99e8773426bc2033dfb"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -2458,9 +2476,11 @@ version = "0.0.6"
 dependencies = [
  "binary-heap-plus",
  "clap",
+ "compare",
  "fnv",
  "itertools 0.10.0",
  "memchr 2.4.0",
+ "mimalloc",
  "ouroboros",
  "rand 0.7.3",
  "rayon",

@@ -7,137 +7,168 @@
 //! for the file. The channel back from the sorter to the reader on the other hand has two purposes: To allow the reader
 //! to reuse memory allocations and to tell the reader which file to read from next.
 //! TODO: this would easily allow for multiple readers. Do we need more than one, are readers the bottleneck? We could
-//! dynamically launch more readers. Problem: carry_over
+//! dynamically launch more readers.
 //!
+//! The implementation here has one big problem: It relies on OwnedLines, i.e. copies each line into a newly allocated String.
+//! That seems to be very bad for the system memory allocator, but using MiMalloc seems to mitigate that. Nonetheless, a non-allocating
+//! version would probably be much better.
 
 use std::{
     cmp::Ordering,
-    io::Read,
-    iter,
-    marker::PhantomData,
-    sync::mpsc::{Receiver, Sender, SyncSender},
+    collections::VecDeque,
+    ffi::OsStr,
+    io::{BufRead, BufReader, Read, Split},
+    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
+    thread,
 };
 
-use binary_heap_plus::{BinaryHeap, FnComparator};
-use ouroboros::self_referencing;
+use binary_heap_plus::BinaryHeap;
+use compare::Compare;
 
-use crate::{
-    ext_sort::{load_lines, read_to_chunk},
-    BorrowedLine, GlobalSettings,
-};
+use crate::{compare_by, open, GlobalSettings, Line, OwningLine};
 
-fn merge(files: Vec<String>) {}
-#[self_referencing]
-struct Payload {
-    string: Vec<u8>,
-    #[borrows(string)]
-    #[not_covariant]
-    lines: Vec<BorrowedLine<'this>>,
-    // The amount of bytes we need to carry over.
-    offset: usize,
+pub fn merge<'a>(files: &[impl AsRef<OsStr>], settings: &'a GlobalSettings) -> FileMerger<'a> {
+    let (recycled_sender, recycled_receiver) = channel();
+    let mut loaded_senders = Vec::with_capacity(files.len());
+    let mut loaded_receivers = Vec::with_capacity(files.len());
+    let mut buffered_files = Vec::with_capacity(files.len());
+    for file in files {
+        if let Some(file) = open(file) {
+            let (sender, receiver) = sync_channel(2);
+            loaded_receivers.push(receiver);
+            loaded_senders.push(sender);
+            buffered_files.push(BufReader::new(file).split(if settings.zero_terminated {
+                b'\0'
+            } else {
+                b'\n'
+            }));
+        }
+    }
+
+    thread::spawn({
+        let settings = settings.clone();
+        || reader(recycled_receiver, buffered_files, loaded_senders, settings)
+    });
+    sorter(settings, loaded_receivers, recycled_sender)
 }
+
 fn reader(
-    rec: Receiver<(usize, Payload)>,
-    files: Vec<Box<dyn Read>>,
-    senders: Vec<SyncSender<Payload>>,
+    rec: Receiver<(usize, VecDeque<OwningLine>)>,
+    mut files: Vec<Split<BufReader<Box<dyn Read + Send>>>>,
+    senders: Vec<SyncSender<VecDeque<OwningLine>>>,
+    settings: GlobalSettings,
 ) {
-    while let Ok((file_idx, recycle)) = rec.recv() {}
+    while let Ok((file_idx, mut recycle)) = rec.recv() {
+        assert!(recycle.is_empty());
+        const MAX_READ: usize = 8 * 1024;
+        let mut read = 0;
+        for line in (&mut files[file_idx]).flatten() {
+            read += line.len();
+
+            let line = Line::create(String::from_utf8(line).unwrap().into_boxed_str(), &settings);
+            recycle.push_back(line);
+            if read >= MAX_READ {
+                break;
+            }
+        }
+        /*println!(
+            "read {}:\n {:?}",
+            file_idx,
+            recycle
+                .iter()
+                .map(|line| line.borrow_line().as_ref())
+                .collect::<Vec<&str>>()
+        );*/
+        senders[file_idx].send(recycle).unwrap();
+    }
 }
 
-struct MergeableFile {
-    current_chunk: Payload,
-    // index into current_chunk. let's not make this struct self-referential as well.
-    line_idx: usize,
-    chunk_receiver: Receiver<Payload>,
+pub struct MergeableFile {
+    current_chunk: VecDeque<OwningLine>,
+    receiver: Receiver<VecDeque<OwningLine>>,
+    file_number: usize,
 }
 
-struct FileMerger</*'a,*/ T>
-where
-    T: Fn(&MergeableFile, &MergeableFile) -> Ordering, /*+ 'a*/
-{
-    heap: BinaryHeap<MergeableFile, T>,
-    request_sender: Sender<(usize, Payload)>,
+pub struct FileMerger<'a> {
+    heap: BinaryHeap<MergeableFile, FileComparator<'a>>,
+    request_sender: Sender<(usize, VecDeque<OwningLine>)>,
     //_p: PhantomData<&'a ()>,
 }
 
-impl<T> Iterator for FileMerger<T>
-where
-    T: Fn(&MergeableFile, &MergeableFile) -> Ordering,
-{
-    type Item;
+impl<'a> Iterator for FileMerger<'a> {
+    type Item = OwningLine;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if let Some(mut file) = self.heap.peek_mut() {
+            if file.current_chunk.len() > 1 {
+                return Some(file.current_chunk.pop_front().unwrap());
+            } else {
+                let mut next_chunk = file.receiver.recv().unwrap();
+                if !next_chunk.is_empty() {
+                    let ret = file.current_chunk.pop_front().unwrap();
+                    std::mem::swap(&mut file.current_chunk, &mut next_chunk);
+                    self.request_sender
+                        .send((file.file_number, next_chunk))
+                        .unwrap();
+                    return Some(ret);
+                }
+            }
+        }
+        self.heap.pop().map(|mut f| {
+            assert_eq!(f.current_chunk.len(), 1);
+            f.current_chunk.pop_front().unwrap()
+        })
     }
 }
 
 fn sorter(
     settings: &'_ GlobalSettings,
-    mut files: Vec<Box<dyn Read>>,
-    receivers: Vec<Receiver<Payload>>,
-    sender: Sender<(usize, Payload)>,
-) -> FileMerger<impl for<'r, 's> Fn(&'r MergeableFile, &'s MergeableFile) -> Ordering + '_> {
-    let separator = if settings.zero_terminated {
-        b'\0'
-    } else {
-        b'\n'
-    };
-    let files_len = files.len();
-    let mut mergeable_files = Vec::with_capacity(files_len);
-    let mut next_payloads = Vec::with_capacity(files_len);
-    for file in &mut files {
-        // This first read is not parallelized...
-        let mut buffer = vec![0u8; settings.buffer_size / files_len / 50];
-        let (read, _) = read_to_chunk(file, &mut iter::empty(), &mut buffer, 0, separator);
-        let carry_amount = buffer.len() - read;
-        let mut next_buffer = vec![0u8; settings.buffer_size / files_len / 50];
-        if next_buffer.len() < carry_amount {
-            // Edge case: The buffer is smaller than the carry-over
-            next_buffer.resize(carry_amount + 10 * 1024, 0);
+    receivers: Vec<Receiver<VecDeque<OwningLine>>>,
+    sender: Sender<(usize, VecDeque<OwningLine>)>,
+) -> FileMerger<'_> {
+    for _ in 0..2 {
+        for index in 0..receivers.len() {
+            sender.send((index, VecDeque::new())).unwrap();
         }
-        next_buffer[..carry_amount].copy_from_slice(&buffer[read..]);
-        next_payloads.push(Payload::new(next_buffer, |_| Vec::new(), carry_amount));
-        let payload = Payload::new(
-            buffer,
-            |buf| {
-                let mut lines = Vec::new();
-                let read = crash_if_err!(1, std::str::from_utf8(&buf[..read]));
-                load_lines(read, &mut lines, separator, &settings);
-                lines
-            },
-            0,
-        );
-        mergeable_files.push(payload);
     }
-    for (idx, payload) in next_payloads.into_iter().enumerate() {
-        sender.send((idx, payload)).unwrap();
-    }
-    FileMerger {
-        heap: BinaryHeap::from_vec_cmp(
-            mergeable_files
-                .into_iter()
-                .zip(receivers.into_iter())
-                .map(|(payload, receiver)| MergeableFile {
-                    current_chunk: payload,
-                    line_idx: 0,
-                    chunk_receiver: receiver,
+
+    let mergeable_files: Vec<MergeableFile> = receivers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(file_number, receiver)| {
+            let first_chunk = receiver.recv().unwrap();
+            if first_chunk.is_empty() {
+                None
+            } else {
+                Some(MergeableFile {
+                    current_chunk: first_chunk,
+                    receiver,
+                    file_number,
                 })
-                .collect(),
-            make_cmp(settings),
-        ),
+            }
+        })
+        .collect();
+
+    FileMerger {
+        heap: BinaryHeap::from_vec_cmp(mergeable_files, FileComparator { settings }),
         request_sender: sender, //_p: PhantomData,
     }
 }
 
-fn cmp(a: &MergeableFile, b: &MergeableFile) -> Ordering {
-    panic!()
+struct FileComparator<'a> {
+    settings: &'a GlobalSettings,
 }
 
-fn make_cmp(
-    settings: &'_ GlobalSettings,
-) -> impl for<'r, 's> Fn(&'r MergeableFile, &'s MergeableFile) -> Ordering + '_ {
-    move |a, b| {
-        settings;
-        Ordering::Equal
+impl<'a> Compare<MergeableFile> for FileComparator<'a> {
+    fn compare(&self, a: &MergeableFile, b: &MergeableFile) -> Ordering {
+        let mut cmp = compare_by(
+            &a.current_chunk.front().unwrap(),
+            &b.current_chunk.front().unwrap(),
+            self.settings,
+        );
+        if cmp == Ordering::Equal {
+            cmp = a.file_number.cmp(&b.file_number);
+        }
+        cmp.reverse()
     }
 }

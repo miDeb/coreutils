@@ -19,12 +19,13 @@ use ouroboros::self_referencing;
 use tempdir::TempDir;
 
 use crate::{
-    file_to_lines_iter, sort_by, BorrowedLine, FileMerger, GlobalSettings, Line, OwningLine,
+    file_merger, sort_by, BorrowedLine, GlobalSettings, Line,
+    OwningLine,
 };
 
 /// Iterator that provides sorted `T`s
 pub struct ExtSortedIterator<'a> {
-    file_merger: FileMerger<'a>,
+    file_merger: file_merger::FileMerger<'a>,
     // Keep tmp_dir around, it is deleted when dropped.
     _tmp_dir: TempDir,
 }
@@ -167,7 +168,9 @@ fn reader_writer(
             replacement.clear();
             unsafe {
                 // Safe to transmute to a vector of lines with longer lifetime, vec is empty
-                std::mem::transmute::<Vec<BorrowedLine<'_>>, Vec<BorrowedLine<'static>>>(replacement)
+                std::mem::transmute::<Vec<BorrowedLine<'_>>, Vec<BorrowedLine<'static>>>(
+                    replacement,
+                )
             }
         });
 
@@ -256,15 +259,14 @@ pub fn ext_sort<'a>(
         sorted_receiver,
         recycled_sender,
     );
-    let mut file_merger = FileMerger::new(settings);
+    let mut files = vec![];
     for i in 0..chunks_read {
-        file_merger.push_file(Box::new(
-            file_to_lines_iter(tmp_dir.path().join(i.to_string()), settings).unwrap(),
-        ));
+        files.push(tmp_dir.path().join(i.to_string()));
     }
+
     eprintln!("created file merger");
     ExtSortedIterator {
-        file_merger,
+        file_merger: file_merger::merge(&files, settings),
         _tmp_dir: tmp_dir,
     }
 }
