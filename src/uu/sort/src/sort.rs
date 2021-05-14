@@ -18,6 +18,7 @@ extern crate uucore;
 mod custom_str_cmp;
 mod ext_sort;
 mod numeric_str_cmp;
+mod file_merger;
 
 use clap::{App, Arg};
 use custom_str_cmp::custom_str_cmp;

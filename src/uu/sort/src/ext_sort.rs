@@ -46,7 +46,7 @@ fn write_chunk(file: &Path, chunk: &[BorrowedLine<'_>], separator: u8) {
     crash_if_err!(1, buf_write.flush());
 }
 
-fn read_to_chunk<'chunk>(
+pub fn read_to_chunk<'chunk>(
     file: &mut Box<dyn Read>,
     next_files: &mut impl Iterator<Item = Box<dyn Read>>,
     chunk: &'chunk mut Vec<u8>,
@@ -205,7 +205,7 @@ fn reader_writer(
     }
 }
 
-fn load_lines<'a>(
+pub fn load_lines<'a>(
     mut read: &'a str,
     lines: &mut Vec<BorrowedLine<'a>>,
     separator: u8,
