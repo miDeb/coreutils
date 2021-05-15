@@ -79,8 +79,8 @@ Example: Run `hyperfine './target/release/coreutils sort shuffled_wordlist.txt -
 ## Merging
 "Merge" sort merges already sorted files. It is a sub-step of external sorting, so profiling it separately may be helpful.
 - Splitting `shuffled_wordlist.txt` can be achieved by running `split shuffled_wordlist.txt shuffled_wordlist_slice_ --additional-suffix=.txt`
-- Sort each part by running `for f in shuffled_wordlist_slice_*; do  sort $f -o $f; done`
-- Benchmark merging by running
+- Sort each part by running `for f in shuffled_wordlist_slice_*; do sort $f -o $f; done`
+- Benchmark merging by running `hyperfine "target/release/coreutils sort -m shuffled_wordlist_slice_*"`
 
 ## Stdout and stdin performance
 

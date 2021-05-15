@@ -45,11 +45,6 @@ use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 use uucore::InvalidEncodingHandling;
 
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 static NAME: &str = "sort";
 static ABOUT: &str = "Display sorted concatenation of all FILE(s).";
 static VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -569,10 +564,10 @@ impl FieldSelector {
             is_full_range: from.field == 1
                 && from.char == 1
                 && to.is_none()
-                && !matches!(
-                    settings.mode,
-                    SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric
-                ),
+                && match settings.mode {
+                    SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric => false,
+                    _ => true,
+                },
             needs_tokens: from.field != 1 || from.char == 0 || to.is_some(),
             from,
             to,
