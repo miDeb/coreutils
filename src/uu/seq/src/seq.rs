@@ -189,7 +189,7 @@ fn print_seq(
     pad: bool,
     padding: usize,
 ) {
-    let mut i = 0isize;
+    let mut i = 0usize;
     let mut value = first + i as f64 * increment;
     while !done_printing(value, increment, last) {
         let istr = format!("{:.*}", largest_dec, value);
@@ -201,7 +201,7 @@ fn print_seq(
             }
         }
         print!("{}", istr);
-        i += 1;
+        i += i.checked_add(1).unwrap_or_else(|| crash!(1, "tmp crash"));
         value = first + i as f64 * increment;
         if !done_printing(value, increment, last) {
             print!("{}", separator);
