@@ -221,8 +221,9 @@ fn format_string(
 
     Ok(match implicit_padding.unwrap_or(options.padding) {
         p if p == 0 => number,
-        p if p > 0 => format!("{:>padding$}", number, padding = p as usize),
-        p => format!("{:<padding$}", number, padding = p.abs() as usize),
+        p if p > 0 && p <= 1024 => format!("{:>padding$}", number, padding = p as usize),
+        p if p < 0 && p >= 1024 => format!("{:<padding$}", number, padding = p.abs() as usize),
+        _ => crash!(1, "tmp crash"),
     })
 }
 
