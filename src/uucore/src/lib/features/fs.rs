@@ -162,6 +162,8 @@ pub fn canonicalize<P: AsRef<Path>>(original: P, can_mode: CanonicalizeMode) -> 
             .join(original)
     };
 
+    dbg!(&original);
+
     let mut result = PathBuf::new();
     let mut parts = vec![];
 
@@ -183,46 +185,51 @@ pub fn canonicalize<P: AsRef<Path>>(original: P, can_mode: CanonicalizeMode) -> 
         }
     }
 
+    dbg!(&parts);
+
     // Resolve the symlinks where possible
     if !parts.is_empty() {
         for part in parts[..parts.len() - 1].iter() {
+            dbg!(&part);
             result.push(part);
 
             if can_mode == CanonicalizeMode::None {
                 continue;
             }
 
-            match resolve(&result) {
+            match resolve(dbg!(&result)) {
                 Err(e) => match can_mode {
                     CanonicalizeMode::Missing => continue,
                     _ => return Err(e),
                 },
                 Ok(path) => {
+                    dbg!(&path);
                     result.pop();
                     result.push(path);
                 }
             }
         }
 
-        result.push(parts.last().unwrap());
+        result.push(dbg!(parts.last().unwrap()));
 
         if can_mode == CanonicalizeMode::None {
             return Ok(result);
         }
 
-        match resolve(&result) {
+        match resolve(dbg!(&result)) {
             Err(e) => {
                 if can_mode == CanonicalizeMode::Existing {
                     return Err(e);
                 }
             }
             Ok(path) => {
+                dbg!(&path);
                 result.pop();
                 result.push(path);
             }
         }
     }
-    Ok(result)
+    Ok(dbg!(result))
 }
 
 #[cfg(unix)]
