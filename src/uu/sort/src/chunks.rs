@@ -108,7 +108,7 @@ pub fn read(
                 // because it was only temporarily transmuted to a Vec<Line<'static>> to make recycling possible.
                 std::mem::transmute::<Vec<Line<'static>>, Vec<Line<'_>>>(lines)
             };
-            let read = crash_if_err!(1, std::str::from_utf8(&buf[..read]));
+            let read = crash_if_err!(2, std::str::from_utf8(&buf[..read]));
             parse_lines(read, &mut lines, separator, &settings);
             lines
         });
@@ -225,7 +225,7 @@ fn read_to_buffer(
             Err(e) if e.kind() == ErrorKind::Interrupted => {
                 // retry
             }
-            Err(e) => crash!(1, "{}", e),
+            Err(e) => crash!(2, "{}", e),
         }
     }
 }

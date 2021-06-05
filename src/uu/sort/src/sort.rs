@@ -181,7 +181,7 @@ impl GlobalSettings {
         let num_usize: usize = num_str
             .trim()
             .parse()
-            .unwrap_or_else(|e| crash!(1, "failed to parse buffer size `{}`: {}", num_str, e));
+            .unwrap_or_else(|e| crash!(2, "failed to parse buffer size `{}`: {}", num_str, e));
 
         num_usize.saturating_mul(1000usize.saturating_pow(si_unit as u32))
     }
@@ -370,13 +370,13 @@ impl<'a> Line<'a> {
 
     fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) {
         if settings.zero_terminated && !settings.debug {
-            crash_if_err!(1, writer.write_all(self.line.as_bytes()));
-            crash_if_err!(1, writer.write_all(b"\0"));
+            crash_if_err!(2, writer.write_all(self.line.as_bytes()));
+            crash_if_err!(2, writer.write_all(b"\0"));
         } else if !settings.debug {
-            crash_if_err!(1, writer.write_all(self.line.as_bytes()));
-            crash_if_err!(1, writer.write_all(b"\n"));
+            crash_if_err!(2, writer.write_all(self.line.as_bytes()));
+            crash_if_err!(2, writer.write_all(b"\n"));
         } else {
-            crash_if_err!(1, self.print_debug(settings, writer));
+            crash_if_err!(2, self.print_debug(settings, writer));
         }
     }
 
@@ -1187,14 +1187,14 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         /* if no file, default to stdin */
         files.push("-".to_owned());
     } else if settings.check && files.len() != 1 {
-        crash!(1, "extra operand `{}' not allowed with -c", files[1])
+        crash!(2, "extra operand `{}' not allowed with -c", files[1])
     }
 
     if let Some(arg) = matches.args.get(OPT_SEPARATOR) {
         let separator = arg.vals[0].to_string_lossy();
         let separator = separator;
         if separator.len() != 1 {
-            crash!(1, "separator must be exactly one character long");
+            crash!(2, "separator must be exactly one character long");
         }
         settings.separator = Some(separator.chars().next().unwrap())
     }
@@ -1244,7 +1244,7 @@ fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
         file_merger.write_all(settings);
     } else if settings.check {
         if files.len() > 1 {
-            crash!(1, "only one file allowed with -c");
+            crash!(2, "only one file allowed with -c");
         }
         return check::check(files.first().unwrap(), settings);
     } else {

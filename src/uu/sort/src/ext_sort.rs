@@ -196,11 +196,11 @@ fn reader_writer(
 fn write(chunk: &mut Chunk, file: &Path, separator: u8) {
     chunk.with_lines_mut(|lines| {
         // Write the lines to the file
-        let file = crash_if_err!(1, OpenOptions::new().create(true).write(true).open(file));
+        let file = crash_if_err!(2, OpenOptions::new().create(true).write(true).open(file));
         let mut writer = BufWriter::new(file);
         for s in lines.iter() {
-            crash_if_err!(1, writer.write_all(s.line.as_bytes()));
-            crash_if_err!(1, writer.write_all(&[separator]));
+            crash_if_err!(2, writer.write_all(s.line.as_bytes()));
+            crash_if_err!(2, writer.write_all(&[separator]));
         }
     });
 }
