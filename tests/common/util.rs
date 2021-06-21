@@ -1,4 +1,5 @@
 //spell-checker: ignore (linux) rlimit prlimit Rlim
+//spell-checker: ignore (misc) llvm
 
 #![allow(dead_code)]
 
@@ -942,6 +943,10 @@ impl UCommand {
             .stdin(self.stdin.take().unwrap_or_else(Stdio::piped))
             .stdout(self.stdout.take().unwrap_or_else(Stdio::piped))
             .stderr(self.stderr.take().unwrap_or_else(Stdio::piped))
+            .env(
+                "LLVM_PROFILE_FILE",
+                std::env::var("LLVM_PROFILE_FILE").unwrap_or_default(),
+            )
             .spawn()
             .unwrap();
 

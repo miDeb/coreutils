@@ -1,9 +1,9 @@
 name: CICD
 
 # spell-checker:ignore (acronyms) CICD MSVC musl
-# spell-checker:ignore (env/flags) Awarnings Ccodegen Coverflow Cpanic RUSTDOCFLAGS RUSTFLAGS Zpanic
+# spell-checker:ignore (env/flags) Awarnings RUSTDOCFLAGS RUSTFLAGS Zinstrument
 # spell-checker:ignore (jargon) SHAs deps softprops toolchain
-# spell-checker:ignore (names) CodeCOV MacOS MinGW Peltoche rivy
+# spell-checker:ignore (names) CodeCOV MacOS MinGW Peltoche rivy llvm profraw
 # spell-checker:ignore (shell/tools) choco clippy dmake dpkg esac fakeroot gmake grcov halium lcov libssl mkdir popd printf pushd rustc rustfmt rustup shopt xargs
 # spell-checker:ignore (misc) aarch alnum armhf bindir busytest coreutils gnueabihf issuecomment maint nullglob onexitbegin onexitend runtest tempfile testsuite uutils
 
@@ -12,7 +12,6 @@ env:
   PROJECT_DESC: "Core universal (cross-platform) utilities"
   PROJECT_AUTH: "uutils"
   RUST_MIN_SRV: "1.43.1" ## v1.43.0
-  RUST_COV_SRV: "2020-08-01" ## (~v1.47.0) supported rust version for code coverage; (date required/used by 'coverage') ## !maint: refactor when code coverage support is included in the stable channel
 
 on: [push, pull_request]
 
@@ -486,7 +485,6 @@ jobs:
         job:
           - { os: ubuntu-latest  , features: unix }
           - { os: macos-latest   , features: macos }
-          - { os: windows-latest , features: windows }
     steps:
     - uses: actions/checkout@v1
     - name: Install/setup prerequisites
@@ -505,7 +503,7 @@ jobs:
         ## VARs setup
         outputs() { for var in "$@" ; do echo steps.vars.outputs.${var}="${!var}"; echo ::set-output name=${var}::${!var}; done; }
         # toolchain
-        TOOLCHAIN="nightly-${{ env.RUST_COV_SRV }}" ## default to "nightly" toolchain (required for certain required unstable compiler flags) ## !maint: refactor when stable channel has needed support
+        TOOLCHAIN="nightly" ## default to "nightly" toolchain (required for certain required unstable compiler flags) ## !maint: refactor when stable channel has needed support
         # * specify gnu-type TOOLCHAIN for windows; `grcov` requires gnu-style code coverage data files
         case ${{ matrix.job.os }} in windows-*) TOOLCHAIN="$TOOLCHAIN-x86_64-pc-windows-gnu" ;; esac;
         # * use requested TOOLCHAIN if specified
@@ -527,6 +525,12 @@ jobs:
         # * CODECOV_FLAGS
         CODECOV_FLAGS=$( echo "${{ matrix.job.os }}" | sed 's/[^[:alnum:]]/_/g' )
         outputs CODECOV_FLAGS
+        COVERAGE_REPORT_DIR="target/debug"
+        mkdir -p "${COVERAGE_REPORT_DIR}"
+        COVERAGE_REPORT_DIR=$(realpath "target/debug")
+        outputs COVERAGE_REPORT_DIR
+        LLVM_PROFILE_FILE="${COVERAGE_REPORT_DIR}/coreutils-%p-%m.profraw"
+        outputs LLVM_PROFILE_FILE
     - name: rust toolchain ~ install
       uses: actions-rs/toolchain@v1
       with:
@@ -549,10 +553,8 @@ jobs:
         command: test
         args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast -p uucore
       env:
-        CARGO_INCREMENTAL: '0'
-        RUSTC_WRAPPER: ''
-        RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort'
-        RUSTDOCFLAGS: '-Cpanic=abort'
+        RUSTFLAGS: "-Zinstrument-coverage"
+        LLVM_PROFILE_FILE: ${{ steps.vars.outputs.LLVM_PROFILE_FILE }}
         # RUSTUP_TOOLCHAIN: ${{ steps.vars.outputs.TOOLCHAIN }}
     - name: Test
       uses: actions-rs/cargo@v1
@@ -560,10 +562,8 @@ jobs:
         command: test
         args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast
       env:
-        CARGO_INCREMENTAL: '0'
-        RUSTC_WRAPPER: ''
-        RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort'
-        RUSTDOCFLAGS: '-Cpanic=abort'
+        RUSTFLAGS: "-Zinstrument-coverage"
+        LLVM_PROFILE_FILE: ${{ steps.vars.outputs.LLVM_PROFILE_FILE }}
         # RUSTUP_TOOLCHAIN: ${{ steps.vars.outputs.TOOLCHAIN }}
     - name: Test individual utilities
       uses: actions-rs/cargo@v1
@@ -571,10 +571,8 @@ jobs:
         command: test
         args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast ${{ steps.dep_vars.outputs.CARGO_UTILITY_LIST_OPTIONS }}
       env:
-        CARGO_INCREMENTAL: '0'
-        RUSTC_WRAPPER: ''
-        RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort'
-        RUSTDOCFLAGS: '-Cpanic=abort'
+        RUSTFLAGS: "-Zinstrument-coverage"
+        LLVM_PROFILE_FILE: ${{ steps.vars.outputs.LLVM_PROFILE_FILE }}
         # RUSTUP_TOOLCHAIN: ${{ steps.vars.outputs.TOOLCHAIN }}
     - name: "`grcov` ~ install"
       uses: actions-rs/install@v0.1
@@ -585,17 +583,17 @@ jobs:
     - name: Generate coverage data (via `grcov`)
       id: coverage
       shell: bash
+      env:
+        COVERAGE_REPORT_DIR: ${{ steps.vars.outputs.COVERAGE_REPORT_DIR }}
       run: |
         # generate coverage data
-        COVERAGE_REPORT_DIR="target/debug"
         COVERAGE_REPORT_FILE="${COVERAGE_REPORT_DIR}/lcov.info"
         # GRCOV_IGNORE_OPTION='--ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*"' ## `grcov` ignores these params when passed as an environment variable (why?)
         # GRCOV_EXCLUDE_OPTION='--excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"' ## `grcov` ignores these params when passed as an environment variable (why?)
-        mkdir -p "${COVERAGE_REPORT_DIR}"
         # display coverage files
-        grcov . --output-type files --ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()" | sort --unique
+        grcov . --binary-path ./target/debug/ --output-type files --branch --ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()" | sort --unique
         # generate coverage report
-        grcov . --output-type lcov --output-path "${COVERAGE_REPORT_FILE}" --branch --ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"
+        grcov . --binary-path ./target/debug/ --output-type lcov --branch --output-path "${COVERAGE_REPORT_FILE}" --branch --ignore build.rs --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"
         echo ::set-output name=report::${COVERAGE_REPORT_FILE}
     - name: Upload coverage results (to Codecov.io)
       uses: codecov/codecov-action@v1
