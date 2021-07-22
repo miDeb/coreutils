@@ -22,6 +22,8 @@ use std::{
 };
 
 use itertools::Itertools;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
 
 use crate::chunks::RecycledChunk;
 use crate::merge::ClosedTmpFile;
@@ -92,7 +94,7 @@ fn reader_writer<F: Iterator<Item = Box<dyn Read + Send>>, Tmp: WriteableTmpFile
         ReadResult::WroteChunksToFile { tmp_files, tmp_dir } => {
             let tmp_dir_size = tmp_files.len();
             let mut merger = merge::merge_with_file_limit::<_, _, Tmp>(
-                tmp_files.into_iter().map(|c| c.reopen()),
+                tmp_files.into_par_iter().map(|c| c.reopen()),
                 settings,
                 Some((tmp_dir, tmp_dir_size)),
             );

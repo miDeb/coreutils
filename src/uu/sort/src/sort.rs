@@ -1336,7 +1336,7 @@ pub fn uu_app() -> App<'static, 'static> {
 
 fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
     if settings.merge {
-        let mut file_merger = merge::merge(files.iter().map(open), settings);
+        let mut file_merger = merge::merge(files.into_par_iter().map(open), settings);
         file_merger.write_all(settings);
     } else if settings.check {
         if files.len() > 1 {

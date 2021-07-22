@@ -20,7 +20,7 @@ use std::{
 };
 
 use compare::Compare;
-use itertools::Itertools;
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use tempfile::TempDir;
 
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
 ///
 /// If `settings.merge_batch_size` is greater than the length of `files`, intermediate files will be used.
 /// If `settings.compress_prog` is `Some`, intermediate files will be compressed with it.
-pub fn merge<Files: ExactSizeIterator<Item = Box<dyn Read + Send>>>(
+pub fn merge<Files: IndexedParallelIterator<Item = Box<dyn Read + Send>>>(
     files: Files,
     settings: &GlobalSettings,
 ) -> FileMerger {
@@ -54,14 +54,17 @@ pub fn merge<Files: ExactSizeIterator<Item = Box<dyn Read + Send>>>(
 // Merge already sorted `MergeInput`s.
 pub fn merge_with_file_limit<
     M: MergeInput + 'static,
-    F: ExactSizeIterator<Item = M>,
+    F: IndexedParallelIterator<Item = M>,
     Tmp: WriteableTmpFile + 'static,
 >(
     files: F,
     settings: &GlobalSettings,
     tmp_dir: Option<(TempDir, usize)>,
 ) -> FileMerger {
-    if files.len() > settings.merge_batch_size {
+    // Since we parallelize the workload we divide the batch size (as set by the user) to our threads.
+    let batch_size =
+        dbg!((settings.merge_batch_size.min(files.len()) / rayon::current_num_threads()).max(2));
+    if files.len() > batch_size * 2 {
         // If we did not get a tmp_dir, create one.
         let (tmp_dir, mut tmp_dir_size) = tmp_dir.unwrap_or_else(|| {
             (
@@ -72,29 +75,28 @@ pub fn merge_with_file_limit<
                 0,
             )
         });
-        let mut remaining_files = files.len();
-        let batches = files.chunks(settings.merge_batch_size);
-        let mut batches = batches.into_iter();
-        let mut temporary_files = vec![];
-        while remaining_files != 0 {
-            // Work around the fact that `Chunks` is not an `ExactSizeIterator`.
-            remaining_files = remaining_files.saturating_sub(settings.merge_batch_size);
-            let mut merger = merge_without_limit(batches.next().unwrap(), settings);
-            let mut tmp_file = Tmp::create(
-                tmp_dir.path().join(tmp_dir_size.to_string()),
-                settings.compress_prog.as_deref(),
-            );
-            tmp_dir_size += 1;
-            merger.write_all_to(settings, tmp_file.as_write());
-            temporary_files.push(tmp_file.finished_writing());
-        }
-        assert!(batches.next().is_none());
+        let batches = files.chunks(batch_size);
+        let temporary_files: Vec<_> = batches
+            .enumerate()
+            .map(|(idx, batch)| {
+                let mut merger = merge_without_limit(batch.into_par_iter(), settings);
+                let mut tmp_file = Tmp::create(
+                    tmp_dir.path().join((tmp_dir_size + idx).to_string()),
+                    settings.compress_prog.as_deref(),
+                );
+                merger.write_all_to(settings, tmp_file.as_write());
+                tmp_file.finished_writing()
+            })
+            .collect();
+        tmp_dir_size += temporary_files.len();
         merge_with_file_limit::<_, _, Tmp>(
             temporary_files
-                .into_iter()
+                .into_par_iter()
                 .map(Box::new(|c: Tmp::Closed| c.reopen())
                     as Box<
-                        dyn FnMut(Tmp::Closed) -> <Tmp::Closed as ClosedTmpFile>::Reopened,
+                        dyn (Fn(Tmp::Closed) -> <Tmp::Closed as ClosedTmpFile>::Reopened)
+                            + Send
+                            + Sync,
                     >),
             settings,
             Some((tmp_dir, tmp_dir_size)),
@@ -108,14 +110,14 @@ pub fn merge_with_file_limit<
 ///
 /// It is the responsibility of the caller to ensure that `files` yields only
 /// as many files as we are allowed to open concurrently.
-fn merge_without_limit<M: MergeInput + 'static, F: Iterator<Item = M>>(
+fn merge_without_limit<M: MergeInput + 'static, F: ParallelIterator<Item = M>>(
     files: F,
     settings: &GlobalSettings,
 ) -> FileMerger {
     let (request_sender, request_receiver) = channel();
-    let mut reader_files = Vec::with_capacity(files.size_hint().0);
-    let mut loaded_receivers = Vec::with_capacity(files.size_hint().0);
-    for (file_number, file) in files.enumerate() {
+    let mut reader_files = Vec::new();
+    let mut loaded_receivers = Vec::new();
+    for (file_number, file) in files.collect::<Vec<_>>().into_iter().enumerate() {
         let (sender, receiver) = sync_channel(2);
         loaded_receivers.push(receiver);
         reader_files.push(Some(ReaderFile {
@@ -125,14 +127,14 @@ fn merge_without_limit<M: MergeInput + 'static, F: Iterator<Item = M>>(
         }));
         // Send the initial chunk to trigger a read for each file
         request_sender
-            .send((file_number, RecycledChunk::new(8 * 1024)))
+            .send((file_number, RecycledChunk::new( 1024)))
             .unwrap();
     }
 
     // Send the second chunk for each file
     for file_number in 0..reader_files.len() {
         request_sender
-            .send((file_number, RecycledChunk::new(8 * 1024)))
+            .send((file_number, RecycledChunk::new( 1024)))
             .unwrap();
     }
 
@@ -347,7 +349,7 @@ pub trait WriteableTmpFile {
     fn as_write(&mut self) -> &mut Self::InnerWrite;
 }
 /// A temporary file that is (temporarily) closed, but can be reopened.
-pub trait ClosedTmpFile {
+pub trait ClosedTmpFile: Send {
     type Reopened: MergeInput;
     /// Reopens the temporary file.
     fn reopen(self) -> Self::Reopened;
@@ -384,6 +386,7 @@ impl WriteableTmpFile for WriteablePlainTmpFile {
     }
 
     fn finished_writing(self) -> Self::Closed {
+        drop(self.file);
         ClosedPlainTmpFile { path: self.path }
     }
 
@@ -404,6 +407,7 @@ impl MergeInput for PlainTmpMergeInput {
     type InnerRead = File;
 
     fn finished_reading(self) {
+        drop(self.file);
         fs::remove_file(self.path).ok();
     }
 
