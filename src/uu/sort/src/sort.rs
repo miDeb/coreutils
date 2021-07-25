@@ -169,7 +169,7 @@ pub struct GlobalSettings {
     buffer_size: usize,
     tmp_dir: PathBuf,
     compress_prog: Option<String>,
-    merge_batch_size: usize,
+    merge_batch_size: Option<usize>,
     precomputed: Precomputed,
 }
 
@@ -266,7 +266,7 @@ impl Default for GlobalSettings {
             buffer_size: DEFAULT_BUF_SIZE,
             tmp_dir: PathBuf::new(),
             compress_prog: None,
-            merge_batch_size: 32,
+            merge_batch_size: None,
             precomputed: Precomputed {
                 num_infos_per_line: 0,
                 floats_per_line: 0,
@@ -1030,9 +1030,9 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     settings.compress_prog = matches.value_of(options::COMPRESS_PROG).map(String::from);
 
     if let Some(n_merge) = matches.value_of(options::BATCH_SIZE) {
-        settings.merge_batch_size = n_merge
-            .parse()
-            .unwrap_or_else(|_| crash!(2, "invalid --batch-size argument '{}'", n_merge));
+        settings.merge_batch_size = Some(n_merge
+                    .parse()
+                    .unwrap_or_else(|_| crash!(2, "invalid --batch-size argument '{}'", n_merge)));
     }
 
     settings.zero_terminated = matches.is_present(options::ZERO_TERMINATED);
@@ -1336,7 +1336,7 @@ pub fn uu_app() -> App<'static, 'static> {
 
 fn exec(files: &[String], settings: &GlobalSettings) -> i32 {
     if settings.merge {
-        let mut file_merger = merge::merge(files.into_par_iter().map(open), settings);
+        let file_merger = merge::merge(files.into_par_iter().map(open), settings);
         file_merger.write_all(settings);
     } else if settings.check {
         if files.len() > 1 {

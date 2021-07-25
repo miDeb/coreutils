@@ -16,7 +16,7 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     rc::Rc,
     sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
-    thread,
+    thread::{self, JoinHandle},
 };
 
 use compare::Compare;
@@ -51,6 +51,22 @@ pub fn merge<Files: IndexedParallelIterator<Item = Box<dyn Read + Send>>>(
     }
 }
 
+fn calculate_batch_size(settings: &GlobalSettings) -> usize {
+    let mut num_threads = rayon::current_num_threads();
+    if let Some(batch_size) = settings.merge_batch_size {
+        if batch_size / num_threads < 2 {
+            num_threads = batch_size / 2;
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build_global()
+                .unwrap()
+        }
+        batch_size / num_threads
+    } else {
+        5
+    }
+}
+
 // Merge already sorted `MergeInput`s.
 pub fn merge_with_file_limit<
     M: MergeInput + 'static,
@@ -61,9 +77,8 @@ pub fn merge_with_file_limit<
     settings: &GlobalSettings,
     tmp_dir: Option<(TempDir, usize)>,
 ) -> FileMerger {
-    // Since we parallelize the workload we divide the batch size (as set by the user) to our threads.
-    let batch_size =
-        dbg!((settings.merge_batch_size.min(files.len()) / rayon::current_num_threads()).max(2));
+    let batch_size = calculate_batch_size(settings);
+
     if files.len() > batch_size * 2 {
         // If we did not get a tmp_dir, create one.
         let (tmp_dir, mut tmp_dir_size) = tmp_dir.unwrap_or_else(|| {
@@ -79,7 +94,7 @@ pub fn merge_with_file_limit<
         let temporary_files: Vec<_> = batches
             .enumerate()
             .map(|(idx, batch)| {
-                let mut merger = merge_without_limit(batch.into_par_iter(), settings);
+                let merger = merge_without_limit(batch.into_iter(), settings);
                 let mut tmp_file = Tmp::create(
                     tmp_dir.path().join((tmp_dir_size + idx).to_string()),
                     settings.compress_prog.as_deref(),
@@ -102,7 +117,7 @@ pub fn merge_with_file_limit<
             Some((tmp_dir, tmp_dir_size)),
         )
     } else {
-        merge_without_limit(files, settings)
+        merge_without_limit(files.collect::<Vec<_>>().into_iter(), settings)
     }
 }
 
@@ -110,14 +125,14 @@ pub fn merge_with_file_limit<
 ///
 /// It is the responsibility of the caller to ensure that `files` yields only
 /// as many files as we are allowed to open concurrently.
-fn merge_without_limit<M: MergeInput + 'static, F: ParallelIterator<Item = M>>(
+fn merge_without_limit<M: MergeInput + 'static, F: Iterator<Item = M>>(
     files: F,
     settings: &GlobalSettings,
 ) -> FileMerger {
     let (request_sender, request_receiver) = channel();
     let mut reader_files = Vec::new();
     let mut loaded_receivers = Vec::new();
-    for (file_number, file) in files.collect::<Vec<_>>().into_iter().enumerate() {
+    for (file_number, file) in files.enumerate() {
         let (sender, receiver) = sync_channel(2);
         loaded_receivers.push(receiver);
         reader_files.push(Some(ReaderFile {
@@ -127,18 +142,18 @@ fn merge_without_limit<M: MergeInput + 'static, F: ParallelIterator<Item = M>>(
         }));
         // Send the initial chunk to trigger a read for each file
         request_sender
-            .send((file_number, RecycledChunk::new( 1024)))
+            .send((file_number, RecycledChunk::new(1024)))
             .unwrap();
     }
 
     // Send the second chunk for each file
     for file_number in 0..reader_files.len() {
         request_sender
-            .send((file_number, RecycledChunk::new( 1024)))
+            .send((file_number, RecycledChunk::new(1024)))
             .unwrap();
     }
 
-    thread::spawn({
+    let handle = thread::spawn({
         let settings = settings.clone();
         move || {
             reader(
@@ -172,6 +187,7 @@ fn merge_without_limit<M: MergeInput + 'static, F: ParallelIterator<Item = M>>(
         ),
         request_sender,
         prev: None,
+        j_h: handle,
     }
 }
 /// The struct on the reader thread representing an input file
@@ -207,7 +223,8 @@ fn reader(
             );
             if !should_continue {
                 // Remove the file from the list by replacing it with `None`.
-                let ReaderFile { file, .. } = files[file_idx].take().unwrap();
+                let ReaderFile { file, sender, .. } = files[file_idx].take().unwrap();
+                drop(sender);
                 // Depending on the kind of the `MergeInput`, this may delete the file:
                 file.finished_reading();
             }
@@ -236,17 +253,21 @@ pub struct FileMerger<'a> {
     heap: binary_heap_plus::BinaryHeap<MergeableFile, FileComparator<'a>>,
     request_sender: Sender<(usize, RecycledChunk)>,
     prev: Option<PreviousLine>,
+    j_h: JoinHandle<()>,
 }
 
 impl<'a> FileMerger<'a> {
     /// Write the merged contents to the output file.
-    pub fn write_all(&mut self, settings: &GlobalSettings) {
+    pub fn write_all(self, settings: &GlobalSettings) {
         let mut out = settings.out_writer();
         self.write_all_to(settings, &mut out);
     }
 
-    pub fn write_all_to(&mut self, settings: &GlobalSettings, out: &mut impl Write) {
+    pub fn write_all_to(mut self, settings: &GlobalSettings, out: &mut impl Write) {
         while self.write_next(settings, out) {}
+
+        drop(self.request_sender);
+        self.j_h.join().unwrap();
     }
 
     fn write_next(&mut self, settings: &GlobalSettings, out: &mut impl Write) -> bool {

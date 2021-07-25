@@ -93,7 +93,7 @@ fn reader_writer<F: Iterator<Item = Box<dyn Read + Send>>, Tmp: WriteableTmpFile
     match read_result {
         ReadResult::WroteChunksToFile { tmp_files, tmp_dir } => {
             let tmp_dir_size = tmp_files.len();
-            let mut merger = merge::merge_with_file_limit::<_, _, Tmp>(
+            let merger = merge::merge_with_file_limit::<_, _, Tmp>(
                 tmp_files.into_par_iter().map(|c| c.reopen()),
                 settings,
                 Some((tmp_dir, tmp_dir_size)),
