@@ -959,3 +959,22 @@ fn test_key_takes_one_arg() {
         .succeeds()
         .stdout_is_fixture("keys_open_ended.expected");
 }
+
+#[test]
+fn test_obsolete_syntax() {
+    let input = "a c\na b\n";
+    let flags_and_out = [
+        (["-s", "+0", "-1"], "a c\na b\n"),
+        (["-s", "+0", "-1.0"], "a c\na b\n"),
+        (["-s", "+0", "-1.1"], "a c\na b\n"),
+        (["-s", "+0", "-1.2"], "a b\na c\n"),
+        (["-s", "+0", "-1.1b"], "a b\na c\n"),
+    ];
+    for (flags, out) in &flags_and_out {
+        new_ucmd!()
+            .args(&flags[..])
+            .pipe_in(input)
+            .succeeds()
+            .stdout_only(out);
+    }
+}

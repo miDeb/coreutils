@@ -24,7 +24,7 @@ mod merge;
 mod numeric_str_cmp;
 
 use chunks::LineData;
-use clap::{crate_version, App, Arg};
+use clap::{App, AppSettings, Arg, crate_version};
 use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
 use fnv::FnvHasher;
@@ -38,6 +38,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{stdin, stdout, BufRead, BufReader, BufWriter, Read, Write};
+use std::iter::Peekable;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
@@ -651,6 +652,42 @@ impl KeyPosition {
             ignore_blanks,
         })
     }
+
+    fn from_obsolete(key: &str, is_start_key: bool) -> Result<Self, String> {
+        let (field, char) = if let Some((a, b)) = key.split_once('.') {
+            (
+                a.parse()
+                    .map_err(|e| format!("failed to parse field index '{}': {}", a, e))?,
+                b.parse()
+                    .map_err(|e| format!("failed to parse character index '{}': {}", a, e))?,
+            )
+        } else {
+            (
+                key.parse()
+                    .map_err(|e| format!("failed to parse field index '{}': {}", key, e))?,
+                0,
+            )
+        };
+        if is_start_key {
+            Ok(Self {
+                field: field + 1,
+                char: char + 1,
+                ignore_blanks: false,
+            })
+        } else if char == 0 {
+            Ok(Self {
+                field,
+                char, // 0
+                ignore_blanks: false,
+            })
+        } else {
+            Ok(Self {
+                field: field + 1,
+                char,
+                ignore_blanks: false,
+            })
+        }
+    }
 }
 
 impl Default for KeyPosition {
@@ -695,6 +732,40 @@ impl FieldSelector {
         } else {
             (position, "")
         }
+    }
+
+    fn parse_obsolete(
+        args: &mut Peekable<impl Iterator<Item = String>>,
+        settings: &GlobalSettings,
+    ) -> Vec<Self> {
+        let mut selectors = Vec::new();
+        while let Some(arg) = args.peek() {
+            if arg.starts_with('+') {
+                let start = crash_if_err!(
+                    2,
+                    KeyPosition::from_obsolete(&arg[1..], true)
+                    .map_err(|e| format!("failed to parse key {}: {}", arg, e))
+                );
+                args.next();
+                let mut end = None;
+                if let Some(next_arg) = args.peek() {
+                    if next_arg.starts_with('-') {
+                        end = Some(crash_if_err!(
+                            2,
+                            KeyPosition::from_obsolete(&next_arg[1..], false)
+                                .map_err(|e| format!("failed to parse key {}: {}", next_arg, e))
+                        ));
+                        args.next();
+                    }
+                }
+
+                // calling unwrap here is safe, because the from char index can never be 0, because it is a usize that has been incremented once.
+                selectors.push(Self::new(start, end, KeySettings::from(settings)).unwrap());
+            } else {
+                break;
+            }
+        }
+        selectors
     }
 
     fn parse(key: &str, global_settings: &GlobalSettings) -> Self {
@@ -1058,13 +1129,6 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
     settings.stable = matches.is_present(options::STABLE);
     settings.unique = matches.is_present(options::UNIQUE);
 
-    if files.is_empty() {
-        /* if no file, default to stdin */
-        files.push("-".to_owned());
-    } else if settings.check && files.len() != 1 {
-        crash!(1, "extra operand `{}' not allowed with -c", files[1])
-    }
-
     if let Some(arg) = matches.args.get(options::SEPARATOR) {
         let separator = arg.vals[0].to_string_lossy();
         let separator = separator;
@@ -1072,6 +1136,28 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
             crash!(1, "separator must be exactly one character long");
         }
         settings.separator = Some(separator.chars().next().unwrap())
+    }
+
+    // parse obsolete syntax +a.b -c.d
+    // -> BUG: clap tries to parse the -c.d part as a flag, making this impossible!
+    // Clap parsed these arguments as the input files.
+    let mut args_iter = matches
+        .values_of(options::FILES)
+        .map::<Vec<String>, _>(|v| v.map(ToString::to_string).collect())
+        .unwrap_or_default()
+        .into_iter()
+        .peekable();
+    settings
+        .selectors
+        .append(&mut FieldSelector::parse_obsolete(
+            &mut args_iter,
+            &settings,
+        ));
+
+    // Only consider the remaining arguments as the input files.
+    // If we got our input files from FILES0_FROM, don't touch them.
+    if !matches.is_present(options::FILES0_FROM) {
+        files = args_iter.collect();
     }
 
     if let Some(values) = matches.values_of(options::KEY) {
@@ -1082,7 +1168,14 @@ pub fn uumain(args: impl uucore::Args) -> i32 {
         }
     }
 
-    if !matches.is_present(options::KEY) {
+    if files.is_empty() {
+        /* if no file, default to stdin */
+        files.push("-".to_owned());
+    } else if settings.check && files.len() != 1 {
+        crash!(1, "extra operand `{}' not allowed with -c", files[1])
+    }
+
+    if settings.selectors.is_empty() {
         // add a default selector matching the whole line
         let key_settings = KeySettings::from(&settings);
         settings.selectors.push(
@@ -1108,6 +1201,7 @@ pub fn uu_app() -> App<'static, 'static> {
     App::new(executable!())
         .version(crate_version!())
         .about(ABOUT)
+        .setting(AppSettings::AllowNegativeNumbers)
         .arg(
             Arg::with_name(options::modes::SORT)
                 .long(options::modes::SORT)
