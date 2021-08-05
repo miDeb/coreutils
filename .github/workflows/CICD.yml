@@ -434,13 +434,7 @@ jobs:
       with:
         use-cross: ${{ steps.vars.outputs.CARGO_USE_CROSS }}
         command: test
-        args: --target=${{ matrix.job.target }} ${{ steps.vars.outputs.CARGO_TEST_OPTIONS}} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }}
-    - name: Test individual utilities
-      uses: actions-rs/cargo@v1
-      with:
-        use-cross: ${{ steps.vars.outputs.CARGO_USE_CROSS }}
-        command: test
-        args: --target=${{ matrix.job.target }} ${{ steps.vars.outputs.CARGO_TEST_OPTIONS}} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} ${{ steps.dep_vars.outputs.CARGO_UTILITY_LIST_OPTIONS }}
+        args: --target=${{ matrix.job.target }} ${{ steps.vars.outputs.CARGO_TEST_OPTIONS}} ${{ matrix.job.cargo-options }} ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --workspace
     - name: Archive executable artifacts
       uses: actions/upload-artifact@v2
       with:
@@ -603,18 +597,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: test
-        args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast
-      env:
-        CARGO_INCREMENTAL: '0'
-        RUSTC_WRAPPER: ''
-        RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort'
-        RUSTDOCFLAGS: '-Cpanic=abort'
-        # RUSTUP_TOOLCHAIN: ${{ steps.vars.outputs.TOOLCHAIN }}
-    - name: Test individual utilities
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast ${{ steps.dep_vars.outputs.CARGO_UTILITY_LIST_OPTIONS }}
+        args: ${{ steps.vars.outputs.CARGO_FEATURES_OPTION }} --no-fail-fast --workspace
       env:
         CARGO_INCREMENTAL: '0'
         RUSTC_WRAPPER: ''
