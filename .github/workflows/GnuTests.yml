@@ -56,7 +56,7 @@ jobs:
         LOG_FILE=gnu/tests/test-suite.log
         if test -f "$LOG_FILE"
         then
-            PASSING=$(sed -n "s/^PASS: \(.\+\)/\1/p" "$LOG_FILE")
+            PASSING=$(sed -n "s/^PASS: \([[:print:]]\+\).*/\1/p" "$LOG_FILE")
             for LINE in $PASSING
             do
               if ! grep -Fxq $LINE uutils/passing-gnu-tests.txt; then
