@@ -90,3 +90,34 @@ jobs:
       with:
         name: gnu-result
         path: gnu-result.json
+    - name: Download the result
+      uses: dawidd6/action-download-artifact@v2
+      with:
+        workflow: GnuTests.yml
+        name: test-report
+        repo: uutils/coreutils
+        branch: master
+        path: dl
+    - name: Compare against master results
+      shell: bash
+      run: |
+            OLD_PASSING=$(sed -n "s/^PASS: \([[:print:]]\+\).*/\1/p" dl/test-suite.log | sort)
+            NEW_PASSING=$(sed -n "s/^PASS: \([[:print:]]\+\).*/\1/p" gnu/tests/test-suite.log | sort)
+            FAIL=false
+            for LINE in $OLD_PASSING
+            do
+              if ! grep -Fxq $LINE<<<"$NEW_PASSING"; then
+                FAIL=true
+                echo "::error ::GNU test failed: $LINE. $LINE is passing on 'master'. Maybe you have to rebase?"
+              fi
+            done
+            for LINE in $NEW_PASSING
+            do
+              if ! grep -Fxq $LINE<<<"$OLD_PASSING"
+              then
+                echo "::warning ::Congrats! The gnu test $LINE is now passing!"
+              fi
+            done
+            if $FAIL; then
+              exit 1;
+            fi
