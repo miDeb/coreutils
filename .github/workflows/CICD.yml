@@ -521,6 +521,35 @@ jobs:
         n_fails=$(echo "$output" | grep "^FAIL:\s" | wc --lines)
         if [ $n_fails -gt 0 ] ; then echo "::warning ::${n_fails}+ test failures" ; fi
 
+  test_freebsd:
+    runs-on: macos-latest
+    name: Tests/FreeBSD test suite
+    env:
+      # https://github.com/rust-lang/rustup/issues/2774
+      RUSTUP_IO_THREADS : 1
+      mem: 2048
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install/setup prerequisites
+      id: test
+      uses: vmactions/freebsd-vm@v0.1.4
+      with:
+        usesh: true
+        prepare: pkg install -y curl gmake
+        run: |
+          curl https://sh.rustup.rs -sSf --output rustup.sh
+          sh rustup.sh -y --profile=minimal
+    - name: "`make build`"
+      shell: bash
+      run: |
+        source $HOME/.cargo/env
+        cargo build
+    - name: "`make test`"
+      shell: bash
+      run: |
+        source $HOME/.cargo/env
+        cargo test -p uucore -p coreutils
+
   coverage:
     name: Code Coverage
     runs-on: ${{ matrix.job.os }}
