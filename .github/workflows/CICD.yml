@@ -548,7 +548,7 @@ jobs:
       shell: bash
       run: |
         source $HOME/.cargo/env
-        cargo test -p uucore -p coreutils
+        cargo test --features feat_os_unix -p uucore -p coreutils
 
   coverage:
     name: Code Coverage
