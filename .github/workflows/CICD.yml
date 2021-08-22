@@ -530,7 +530,7 @@ jobs:
       mem: 2048
     steps:
     - uses: actions/checkout@v2
-    - name: Install/setup prerequisites
+    - name: Test in FreeBSD
       id: test
       uses: vmactions/freebsd-vm@v0.1.4
       with:
@@ -539,16 +539,9 @@ jobs:
         run: |
           curl https://sh.rustup.rs -sSf --output rustup.sh
           sh rustup.sh -y --profile=minimal
-    - name: "`make build`"
-      shell: bash
-      run: |
-        source $HOME/.cargo/env
-        cargo build
-    - name: "`make test`"
-      shell: bash
-      run: |
-        source $HOME/.cargo/env
-        cargo test --features feat_os_unix -p uucore -p coreutils
+          source $HOME/.cargo/bin
+          cargo build
+          cargo test --features feat_os_unix -p uucore -p coreutils
 
   coverage:
     name: Code Coverage
