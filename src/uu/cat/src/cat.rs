@@ -21,15 +21,13 @@ use std::fs::{metadata, File};
 use std::io::{self, Read, Write};
 use thiserror::Error;
 use uucore::error::UResult;
-
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use uucore::fs::FileInformation;
 
 /// Linux splice support
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod splice;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 /// Unix domain socket support
 #[cfg(unix)]
@@ -312,8 +310,7 @@ fn cat_path(
     path: &str,
     options: &OutputOptions,
     state: &mut OutputState,
-    #[cfg(unix)] out_info: &nix::sys::stat::FileStat,
-    #[cfg(windows)] out_info: &winapi_util::file::Information,
+    out_info: Option<&FileInformation>,
 ) -> CatResult<()> {
     if path == "-" {
         let stdin = io::stdin();
@@ -341,10 +338,15 @@ fn cat_path(
         }
         _ => {
             let file = File::open(path)?;
-            #[cfg(any(windows, unix))]
-            if same_file(out_info, &file) {
-                return Err(CatError::OutputIsInput);
+
+            if let Some(out_info) = out_info {
+                if out_info.file_size() != 0
+                    && FileInformation::from_file(&file).as_ref() == Some(out_info)
+                {
+                    return Err(CatError::OutputIsInput);
+                }
             }
+
             let mut handle = InputHandle {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 file_descriptor: file.as_raw_fd(),
@@ -356,25 +358,8 @@ fn cat_path(
     }
 }
 
-#[cfg(unix)]
-fn same_file(a_info: &nix::sys::stat::FileStat, b: &File) -> bool {
-    let b_info = nix::sys::stat::fstat(b.as_raw_fd()).unwrap();
-    b_info.st_size != 0 && b_info.st_dev == a_info.st_dev && b_info.st_ino == a_info.st_ino
-}
-
-#[cfg(windows)]
-fn same_file(a_info: &winapi_util::file::Information, b: &File) -> bool {
-    let b_info = winapi_util::file::information(b).unwrap();
-    b_info.file_size() != 0
-        && b_info.volume_serial_number() == a_info.volume_serial_number()
-        && b_info.file_index() == a_info.file_index()
-}
-
 fn cat_files(files: Vec<String>, options: &OutputOptions) -> UResult<()> {
-    #[cfg(windows)]
-    let out_info = winapi_util::file::information(&std::io::stdout()).unwrap();
-    #[cfg(unix)]
-    let out_info = nix::sys::stat::fstat(std::io::stdout().as_raw_fd()).unwrap();
+    let out_info = FileInformation::from_file(&std::io::stdout());
 
     let mut state = OutputState {
         line_number: 1,
@@ -385,7 +370,7 @@ fn cat_files(files: Vec<String>, options: &OutputOptions) -> UResult<()> {
     let mut error_messages: Vec<String> = Vec::new();
 
     for path in &files {
-        if let Err(err) = cat_path(path, options, &mut state, &out_info) {
+        if let Err(err) = cat_path(path, options, &mut state, out_info.as_ref()) {
             error_messages.push(format!("{}: {}", path, err));
         }
     }
