@@ -9,6 +9,8 @@ use crate::error::strip_errno;
 use crate::error::UResult;
 use crate::error::USimpleError;
 pub use crate::features::entries;
+use crate::fs::is_root;
+use crate::fs::print_error_if_root;
 use crate::fs::resolve_relative_path;
 use crate::show_error;
 use clap::App;
@@ -203,28 +205,16 @@ impl ChownExecutor {
             _ => return 1,
         };
 
-        // Prohibit only if:
-        // (--preserve-root and -R present) &&
-        // (
-        //     (argument is not symlink && resolved to be '/') ||
-        //     (argument is symlink && should follow argument && resolved to be '/')
-        // )
-        if self.recursive && self.preserve_root {
-            let may_exist = if self.dereference {
-                path.canonicalize().ok()
-            } else {
-                let real = resolve_relative_path(path);
-                if real.is_dir() {
-                    Some(real.canonicalize().expect("failed to get real path"))
-                } else {
-                    Some(real.into_owned())
-                }
-            };
-
-            if let Some(p) = may_exist {
-                if p.parent().is_none() {
-                    show_error!("it is dangerous to operate recursively on '/'");
-                    show_error!("use --no-preserve-root to override this failsafe");
+        if self.recursive
+            && self.preserve_root
+            && print_error_if_root(&meta, path, self.dereference)
+        {
+            return 1;
+        }
+        if !self.dereference && meta.file_type().is_symlink() {
+            let meta = path.metadata();
+            if let Ok(meta) = meta {
+                if print_error_if_root(&meta, path, true) {
                     return 1;
                 }
             }
@@ -281,6 +271,7 @@ impl ChownExecutor {
             .follow_links(self.traverse_symlinks == TraverseSymlinks::All)
             .min_depth(1)
             .into_iter();
+
         // We can't use a for loop because we need to manipulate the iterator inside the loop.
         while let Some(entry) = iterator.next() {
             let entry = match entry {
@@ -319,6 +310,21 @@ impl ChownExecutor {
 
             if !self.matched(meta.uid(), meta.gid()) {
                 continue;
+            }
+
+            if self.preserve_root {
+                let dereferenced_meta;
+                let meta = if !self.dereference && meta.file_type().is_symlink() {
+                    dereferenced_meta = path.metadata();
+                    dereferenced_meta.as_ref()
+                } else {
+                    Ok(&meta)
+                };
+                if let Ok(meta) = meta {
+                    if print_error_if_root(meta, path, self.dereference) {
+                        return 1;
+                    }
+                }
             }
 
             ret = match wrap_chown(

@@ -8,6 +8,7 @@
 
 //! Set of functions to manage files and symlinks
 
+use lazy_static::lazy_static;
 #[cfg(unix)]
 use libc::{
     mode_t, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_IRGRP,
@@ -26,6 +27,8 @@ use std::os::unix::{fs::MetadataExt, io::AsRawFd};
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "windows")]
 use winapi_util::AsHandleRef;
+
+use crate::show_error;
 
 #[cfg(unix)]
 #[macro_export]
@@ -140,6 +143,51 @@ impl Hash for FileInformation {
             self.0.volume_serial_number().hash(state);
             self.0.file_index().hash(state);
         }
+    }
+}
+
+#[cfg(unix)]
+lazy_static! {
+    static ref ROOT_INFO: Option<FileInformation> = FileInformation::from_path("/", false);
+}
+
+pub fn is_root(meta: &std::fs::Metadata, path: &Path, dereference_path: bool) -> bool {
+    dbg!(path);
+    dbg!(dereference_path);
+    #[cfg(unix)]
+    if let Some(root_meta) = ROOT_INFO.as_ref()  {
+        return meta.ino() == root_meta.0.st_ino && meta.dev() == root_meta.0.st_dev;
+    }
+
+    if !dereference_path && meta.file_type().is_symlink() {
+        // assume the root is not a symlink
+        false
+    } else if let Ok(canonical_path) =
+        canonicalize(path, MissingHandling::Existing, ResolveMode::Physical)
+    {
+        canonical_path.parent().is_none()
+    } else {
+        // if the file path points nowhere it can't point to the root
+        false
+    }
+}
+
+pub fn print_error_if_root(meta: &std::fs::Metadata, path: &Path, dereference_path: bool) -> bool{
+    if is_root(meta, path, dereference_path) {
+        show_error!(
+            "it is dangerous to operate recursively on '{}'{}",
+            // TODO replace with .quote() assuming that lands first
+            path.display(),
+            if path.as_os_str() != "/" {
+                " (same as '/')"
+            } else {
+                ""
+            }
+        );
+        show_error!("use --no-preserve-root to override this failsafe");
+        true
+    }else {
+        false
     }
 }
 
