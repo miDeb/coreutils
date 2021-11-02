@@ -204,10 +204,22 @@ fn test_change_directory() {
 
     assert_ne!(env::current_dir().unwrap(), temporary_path);
 
-    let out = scene
-        .ucmd()
+    let mut ucmd = scene.ucmd();
+
+    // Hack to get full path
+    // TODO replace this with ucmd.raw.get_program/get_args when command_access feature is stabilized
+    let cmd_path = format!("{:?}", ucmd.raw); // "/path/to/coreutils" "env"
+
+    // Separate "/path/to/coreutils" and "env" using '"' (there could be spaces inside the path)
+    let cmd_path: Vec<_> = cmd_path
+        .split('"')
+        .filter(|s| !(s.is_empty() || s == &" "))
+        .collect();
+
+    let out = ucmd
         .arg("--chdir")
         .arg(&temporary_path)
+        .args(&cmd_path[..])
         .succeeds()
         .stdout_move_str();
 
