@@ -1,6 +1,5 @@
 // spell-checker:ignore (words) bamf chdir rlimit prlimit
 
-#[cfg(not(windows))]
 use std::fs;
 
 use crate::common::util::*;
@@ -172,7 +171,6 @@ fn test_fail_null_with_program() {
         .stderr_contains("cannot specify --null (-0) with command");
 }
 
-#[cfg(not(windows))]
 #[test]
 fn test_change_directory() {
     let scene = TestScenario::new(util_name!());
@@ -181,7 +179,7 @@ fn test_change_directory() {
     assert_ne!(env::current_dir().unwrap(), temporary_path);
 
     // command to print out current working directory
-    let pwd = "pwd";
+    let pwd = if cfg!(windows) { "cd" } else { "pwd" };
 
     let out = scene
         .ucmd()
@@ -191,41 +189,6 @@ fn test_change_directory() {
         .succeeds()
         .stdout_move_str();
     assert_eq!(out.trim(), temporary_path.as_os_str())
-}
-
-// no way to consistently get "current working directory", `cd` doesn't work @ CI
-// instead, we test that the unique temporary directory appears somewhere in the printed variables
-#[cfg(windows)]
-#[test]
-fn test_change_directory() {
-    let scene = TestScenario::new(util_name!());
-    let temporary_directory = tempdir().unwrap();
-    let temporary_path = temporary_directory.path();
-
-    assert_ne!(env::current_dir().unwrap(), temporary_path);
-
-    let mut ucmd = scene.ucmd();
-
-    // Hack to get full path
-    // TODO replace this with ucmd.raw.get_program/get_args when command_access feature is stabilized
-    let cmd_path = format!("{:?}", ucmd.raw); // "/path/to/coreutils" "env"
-
-    // Separate "/path/to/coreutils" and "env" using '"' (there could be spaces inside the path)
-    let cmd_path: Vec<_> = cmd_path
-        .split('"')
-        .filter(|s| !(s.is_empty() || s == &" "))
-        .collect();
-
-    let out = ucmd
-        .arg("--chdir")
-        .arg(&temporary_path)
-        .args(&cmd_path[..])
-        .succeeds()
-        .stdout_move_str();
-
-    assert!(!out
-        .lines()
-        .any(|line| line.ends_with(temporary_path.file_name().unwrap().to_str().unwrap())));
 }
 
 #[test]
