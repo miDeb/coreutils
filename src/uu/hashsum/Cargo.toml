@@ -18,7 +18,7 @@ path = "src/hashsum.rs"
 digest = "0.10.1"
 clap = { version = "3.0", features = ["wrap_help", "cargo"] }
 hex = "0.4.3"
-libc = "0.2.42"
+libc = "0.2.120"
 memchr = "2"
 md-5 = "0.10.1"
 regex = "1.0.1"
