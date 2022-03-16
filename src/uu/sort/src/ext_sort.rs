@@ -25,10 +25,7 @@ use itertools::Itertools;
 use uucore::error::UResult;
 
 use crate::chunks::RecycledChunk;
-use crate::merge::ClosedTmpFile;
-use crate::merge::WriteableCompressedTmpFile;
-use crate::merge::WriteablePlainTmpFile;
-use crate::merge::WriteableTmpFile;
+use crate::merge::{ClosedTmpFile, WriteableTmpFile};
 use crate::tmp_dir::TmpDirWrapper;
 use crate::Output;
 use crate::{
@@ -52,32 +49,18 @@ pub fn ext_sort(
         let settings = settings.clone();
         move || sorter(&recycled_receiver, &sorted_sender, &settings)
     });
-    if settings.compress_prog.is_some() {
-        reader_writer::<_, WriteableCompressedTmpFile>(
-            files,
-            settings,
-            &sorted_receiver,
-            recycled_sender,
-            output,
-            tmp_dir,
-        )
-    } else {
-        reader_writer::<_, WriteablePlainTmpFile>(
-            files,
-            settings,
-            &sorted_receiver,
-            recycled_sender,
-            output,
-            tmp_dir,
-        )
-    }
+    reader_writer(
+        files,
+        settings,
+        &sorted_receiver,
+        recycled_sender,
+        output,
+        tmp_dir,
+    )
 }
 
-fn reader_writer<
-    F: Iterator<Item = UResult<Box<dyn Read + Send>>>,
-    Tmp: WriteableTmpFile + 'static,
->(
-    files: F,
+fn reader_writer(
+    files: impl Iterator<Item = UResult<Box<dyn Read + Send>>>,
     settings: &GlobalSettings,
     receiver: &Receiver<Chunk>,
     sender: SyncSender<Chunk>,
@@ -93,7 +76,7 @@ fn reader_writer<
     // Heuristically chosen: Dividing by 10 seems to keep our memory usage roughly
     // around settings.buffer_size as a whole.
     let buffer_size = settings.buffer_size / 10;
-    let read_result: ReadResult<Tmp> = read_write_loop(
+    let read_result: ReadResult = read_write_loop(
         files,
         tmp_dir,
         separator,
@@ -104,7 +87,7 @@ fn reader_writer<
     )?;
     match read_result {
         ReadResult::WroteChunksToFile { tmp_files } => {
-            let merger = merge::merge_with_file_limit::<_, _, Tmp>(
+            let merger = merge::merge_with_file_limit(
                 tmp_files.into_iter().map(|c| c.reopen()),
                 settings,
                 tmp_dir,
@@ -170,7 +153,7 @@ fn sorter(receiver: &Receiver<Chunk>, sender: &SyncSender<Chunk>, settings: &Glo
 }
 
 /// Describes how we read the chunks from the input.
-enum ReadResult<I: WriteableTmpFile> {
+enum ReadResult {
     /// The input was empty. Nothing was read.
     EmptyInput,
     /// The input fits into a single Chunk, which was kept in memory.
@@ -178,10 +161,10 @@ enum ReadResult<I: WriteableTmpFile> {
     /// The input fits into two chunks, which were kept in memory.
     SortedTwoChunks([Chunk; 2]),
     /// The input was read into multiple chunks, which were written to auxiliary files.
-    WroteChunksToFile { tmp_files: Vec<I::Closed> },
+    WroteChunksToFile { tmp_files: Vec<ClosedTmpFile> },
 }
 /// The function that is executed on the reader/writer thread.
-fn read_write_loop<I: WriteableTmpFile>(
+fn read_write_loop(
     mut files: impl Iterator<Item = UResult<Box<dyn Read + Send>>>,
     tmp_dir: &mut TmpDirWrapper,
     separator: u8,
@@ -189,7 +172,7 @@ fn read_write_loop<I: WriteableTmpFile>(
     settings: &GlobalSettings,
     receiver: &Receiver<Chunk>,
     sender: SyncSender<Chunk>,
-) -> UResult<ReadResult<I>> {
+) -> UResult<ReadResult> {
     let mut file = files.next().unwrap()?;
 
     let mut carry_over = vec![];
@@ -237,7 +220,7 @@ fn read_write_loop<I: WriteableTmpFile>(
             }
         };
 
-        let tmp_file = write::<I>(
+        let tmp_file = write(
             &mut chunk,
             tmp_dir.next_file()?,
             settings.compress_prog.as_deref(),
@@ -267,13 +250,13 @@ fn read_write_loop<I: WriteableTmpFile>(
 
 /// Write the lines in `chunk` to `file`, separated by `separator`.
 /// `compress_prog` is used to optionally compress file contents.
-fn write<I: WriteableTmpFile>(
+fn write(
     chunk: &mut Chunk,
     file: (File, PathBuf),
     compress_prog: Option<&str>,
     separator: u8,
-) -> UResult<I::Closed> {
-    let mut tmp_file = I::create(file, compress_prog)?;
+) -> UResult<ClosedTmpFile> {
+    let mut tmp_file = WriteableTmpFile::create(file, compress_prog)?;
     write_lines(chunk.lines(), tmp_file.as_write(), separator);
     tmp_file.finished_writing()
 }

@@ -14,7 +14,7 @@ use std::{
     io::{BufWriter, Read, Write},
     iter,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdout, Command, Stdio},
     rc::Rc,
     sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
     thread::{self, JoinHandle},
@@ -71,18 +71,18 @@ pub fn merge<'a>(
 ) -> UResult<FileMerger<'a>> {
     replace_output_file_in_input_files(files, output, tmp_dir)?;
     if settings.compress_prog.is_none() {
-        merge_with_file_limit::<_, _, WriteablePlainTmpFile>(
+        merge_with_file_limit(
             files
                 .iter()
-                .map(|file| open(file).map(|file| PlainMergeInput { inner: file })),
+                .map(|file| open(file).map(|file| MergeInput::Plain { inner: file })),
             settings,
             tmp_dir,
         )
     } else {
-        merge_with_file_limit::<_, _, WriteableCompressedTmpFile>(
+        merge_with_file_limit(
             files
                 .iter()
-                .map(|file| open(file).map(|file| PlainMergeInput { inner: file })),
+                .map(|file| open(file).map(|file| MergeInput::Plain { inner: file })),
             settings,
             tmp_dir,
         )
@@ -90,13 +90,8 @@ pub fn merge<'a>(
 }
 
 // Merge already sorted `MergeInput`s.
-pub fn merge_with_file_limit<
-    'a,
-    M: MergeInput + 'static,
-    F: ExactSizeIterator<Item = UResult<M>>,
-    Tmp: WriteableTmpFile + 'static,
->(
-    files: F,
+pub fn merge_with_file_limit<'a>(
+    files: impl ExactSizeIterator<Item = UResult<MergeInput>>,
     settings: &'a GlobalSettings,
     tmp_dir: &mut TmpDirWrapper,
 ) -> UResult<FileMerger<'a>> {
@@ -110,18 +105,16 @@ pub fn merge_with_file_limit<
             remaining_files = remaining_files.saturating_sub(settings.merge_batch_size);
             let merger = merge_without_limit(batches.next().unwrap(), settings)?;
             let mut tmp_file =
-                Tmp::create(tmp_dir.next_file()?, settings.compress_prog.as_deref())?;
+                WriteableTmpFile::create(tmp_dir.next_file()?, settings.compress_prog.as_deref())?;
             merger.write_all_to(settings, tmp_file.as_write())?;
             temporary_files.push(tmp_file.finished_writing()?);
         }
         assert!(batches.next().is_none());
-        merge_with_file_limit::<_, _, Tmp>(
+        merge_with_file_limit(
             temporary_files
                 .into_iter()
-                .map(Box::new(|c: Tmp::Closed| c.reopen())
-                    as Box<
-                        dyn FnMut(Tmp::Closed) -> UResult<<Tmp::Closed as ClosedTmpFile>::Reopened>,
-                    >),
+                .map(Box::new(|c: ClosedTmpFile| c.reopen())
+                    as Box<dyn FnMut(ClosedTmpFile) -> UResult<MergeInput>>),
             settings,
             tmp_dir,
         )
@@ -134,8 +127,8 @@ pub fn merge_with_file_limit<
 ///
 /// It is the responsibility of the caller to ensure that `files` yields only
 /// as many files as we are allowed to open concurrently.
-fn merge_without_limit<M: MergeInput + 'static, F: Iterator<Item = UResult<M>>>(
-    files: F,
+fn merge_without_limit(
+    files: impl Iterator<Item = UResult<MergeInput>>,
     settings: &GlobalSettings,
 ) -> UResult<FileMerger> {
     let (request_sender, request_receiver) = channel();
@@ -202,8 +195,8 @@ fn merge_without_limit<M: MergeInput + 'static, F: Iterator<Item = UResult<M>>>(
     })
 }
 /// The struct on the reader thread representing an input file
-struct ReaderFile<M: MergeInput> {
-    file: M,
+struct ReaderFile {
+    file: MergeInput,
     sender: SyncSender<Chunk>,
     carry_over: Vec<u8>,
 }
@@ -211,7 +204,7 @@ struct ReaderFile<M: MergeInput> {
 /// The function running on the reader thread.
 fn reader(
     recycled_receiver: &Receiver<(usize, RecycledChunk)>,
-    files: &mut [Option<ReaderFile<impl MergeInput>>],
+    files: &mut [Option<ReaderFile>],
     settings: &GlobalSettings,
     separator: u8,
 ) -> UResult<()> {
@@ -227,7 +220,7 @@ fn reader(
                 recycled_chunk,
                 None,
                 carry_over,
-                file.as_read(),
+                &mut file.as_read(),
                 &mut iter::empty(),
                 separator,
                 settings,
@@ -375,181 +368,163 @@ fn check_child_success(mut child: Child, program: &str) -> UResult<()> {
     }
 }
 
-/// A temporary file that can be written to.
-pub trait WriteableTmpFile: Sized {
-    type Closed: ClosedTmpFile;
-    type InnerWrite: Write;
-    fn create(file: (File, PathBuf), compress_prog: Option<&str>) -> UResult<Self>;
-    /// Closes the temporary file.
-    fn finished_writing(self) -> UResult<Self::Closed>;
-    fn as_write(&mut self) -> &mut Self::InnerWrite;
-}
-/// A temporary file that is (temporarily) closed, but can be reopened.
-pub trait ClosedTmpFile {
-    type Reopened: MergeInput;
-    /// Reopens the temporary file.
-    fn reopen(self) -> UResult<Self::Reopened>;
-}
 /// A pre-sorted input for merging.
-pub trait MergeInput: Send {
-    type InnerRead: Read;
-    /// Cleans this `MergeInput` up.
-    /// Implementations may delete the backing file.
-    fn finished_reading(self) -> UResult<()>;
-    fn as_read(&mut self) -> &mut Self::InnerRead;
+
+pub enum MergeInput {
+    TmpFile {
+        path: PathBuf,
+        file: File,
+    },
+    CompressedTmpFile {
+        path: PathBuf,
+        compress_prog: String,
+        child: Child,
+        child_stdout: ChildStdout,
+    },
+    Plain {
+        inner: Box<dyn Read + Send>,
+    },
 }
 
-pub struct WriteablePlainTmpFile {
-    path: PathBuf,
-    file: BufWriter<File>,
-}
-pub struct ClosedPlainTmpFile {
-    path: PathBuf,
-}
-pub struct PlainTmpMergeInput {
-    path: PathBuf,
-    file: File,
-}
-impl WriteableTmpFile for WriteablePlainTmpFile {
-    type Closed = ClosedPlainTmpFile;
-    type InnerWrite = BufWriter<File>;
-
-    fn create((file, path): (File, PathBuf), _: Option<&str>) -> UResult<Self> {
-        Ok(Self {
-            file: BufWriter::new(file),
-            path,
-        })
-    }
-
-    fn finished_writing(self) -> UResult<Self::Closed> {
-        Ok(ClosedPlainTmpFile { path: self.path })
-    }
-
-    fn as_write(&mut self) -> &mut Self::InnerWrite {
-        &mut self.file
-    }
-}
-impl ClosedTmpFile for ClosedPlainTmpFile {
-    type Reopened = PlainTmpMergeInput;
-    fn reopen(self) -> UResult<Self::Reopened> {
-        Ok(PlainTmpMergeInput {
-            file: File::open(&self.path).map_err(|error| SortError::OpenTmpFileFailed { error })?,
-            path: self.path,
-        })
-    }
-}
-impl MergeInput for PlainTmpMergeInput {
-    type InnerRead = File;
-
+impl MergeInput {
+    /// Cleans this `MergeInput` up, deletes the backing file (if there is any).
     fn finished_reading(self) -> UResult<()> {
-        // we ignore failures to delete the temporary file,
-        // because there is a race at the end of the execution and the whole
-        // temporary directory might already be gone.
-        let _ = fs::remove_file(self.path);
-        Ok(())
+        match self {
+            MergeInput::TmpFile { path, .. } => {
+                // We ignore failures to delete the temporary file,
+                // because there is a race at the end of the execution and the whole
+                // temporary directory might already be gone.
+                let _ = fs::remove_file(path);
+                Ok(())
+            }
+            MergeInput::CompressedTmpFile {
+                path,
+                compress_prog,
+                child,
+                child_stdout,
+            } => {
+                drop(child_stdout);
+                check_child_success(child, &compress_prog)?;
+                let _ = fs::remove_file(path);
+                Ok(())
+            }
+            MergeInput::Plain { .. } => Ok(()),
+        }
     }
-
-    fn as_read(&mut self) -> &mut Self::InnerRead {
-        &mut self.file
+    fn as_read(&mut self) -> &mut dyn Read {
+        match self {
+            MergeInput::TmpFile { file, .. } => file,
+            MergeInput::CompressedTmpFile { child_stdout, .. } => child_stdout,
+            MergeInput::Plain { inner } => inner,
+        }
     }
 }
 
-pub struct WriteableCompressedTmpFile {
+pub enum WriteableTmpFile {
+    WriteablePlainTmpFile {
+        path: PathBuf,
+        file: BufWriter<Box<dyn Write>>,
+    },
+    WriteableCompressedTmpFile {
+        path: PathBuf,
+        compress_prog: String,
+        child: Child,
+        child_stdin: BufWriter<Box<dyn Write>>,
+    },
+}
+
+impl WriteableTmpFile {
+    pub fn create((file, path): (File, PathBuf), compress_prog: Option<&str>) -> UResult<Self> {
+        if let Some(compress_prog) = compress_prog {
+            let mut command = Command::new(compress_prog);
+            command.stdin(Stdio::piped()).stdout(file);
+            let mut child =
+                command
+                    .spawn()
+                    .map_err(|err| SortError::CompressProgExecutionFailed {
+                        code: err.raw_os_error().unwrap(),
+                    })?;
+            let child_stdin = child.stdin.take().unwrap();
+            Ok(Self::WriteableCompressedTmpFile {
+                path,
+                compress_prog: compress_prog.to_owned(),
+                child,
+                child_stdin: BufWriter::new(Box::new(child_stdin)),
+            })
+        } else {
+            Ok(Self::WriteablePlainTmpFile {
+                file: BufWriter::new(Box::new(file)),
+                path,
+            })
+        }
+    }
+
+    /// Closes the temporary file.
+    pub fn finished_writing(self) -> UResult<ClosedTmpFile> {
+        match self {
+            WriteableTmpFile::WriteablePlainTmpFile { path, .. } => Ok(ClosedTmpFile {
+                path,
+                compress_prog: None,
+            }),
+            WriteableTmpFile::WriteableCompressedTmpFile {
+                path,
+                compress_prog,
+                child,
+                child_stdin,
+            } => {
+                drop(child_stdin);
+                check_child_success(child, &compress_prog)?;
+                Ok(ClosedTmpFile {
+                    path,
+                    compress_prog: Some(compress_prog),
+                })
+            }
+        }
+    }
+
+    pub fn as_write(&mut self) -> &mut BufWriter<Box<dyn Write>> {
+        match self {
+            WriteableTmpFile::WriteablePlainTmpFile { file: writer, .. }
+            | WriteableTmpFile::WriteableCompressedTmpFile {
+                child_stdin: writer,
+                ..
+            } => writer,
+        }
+    }
+}
+
+/// A temporary file that is (temporarily) closed, but can be reopened.
+pub struct ClosedTmpFile {
     path: PathBuf,
-    compress_prog: String,
-    child: Child,
-    child_stdin: BufWriter<ChildStdin>,
-}
-pub struct ClosedCompressedTmpFile {
-    path: PathBuf,
-    compress_prog: String,
-}
-pub struct CompressedTmpMergeInput {
-    path: PathBuf,
-    compress_prog: String,
-    child: Child,
-    child_stdout: ChildStdout,
-}
-impl WriteableTmpFile for WriteableCompressedTmpFile {
-    type Closed = ClosedCompressedTmpFile;
-    type InnerWrite = BufWriter<ChildStdin>;
-
-    fn create((file, path): (File, PathBuf), compress_prog: Option<&str>) -> UResult<Self> {
-        let compress_prog = compress_prog.unwrap();
-        let mut command = Command::new(compress_prog);
-        command.stdin(Stdio::piped()).stdout(file);
-        let mut child = command
-            .spawn()
-            .map_err(|err| SortError::CompressProgExecutionFailed {
-                code: err.raw_os_error().unwrap(),
-            })?;
-        let child_stdin = child.stdin.take().unwrap();
-        Ok(Self {
-            path,
-            compress_prog: compress_prog.to_owned(),
-            child,
-            child_stdin: BufWriter::new(child_stdin),
-        })
-    }
-
-    fn finished_writing(self) -> UResult<Self::Closed> {
-        drop(self.child_stdin);
-        check_child_success(self.child, &self.compress_prog)?;
-        Ok(ClosedCompressedTmpFile {
-            path: self.path,
-            compress_prog: self.compress_prog,
-        })
-    }
-
-    fn as_write(&mut self) -> &mut Self::InnerWrite {
-        &mut self.child_stdin
-    }
-}
-impl ClosedTmpFile for ClosedCompressedTmpFile {
-    type Reopened = CompressedTmpMergeInput;
-
-    fn reopen(self) -> UResult<Self::Reopened> {
-        let mut command = Command::new(&self.compress_prog);
-        let file = File::open(&self.path).unwrap();
-        command.stdin(file).stdout(Stdio::piped()).arg("-d");
-        let mut child = command
-            .spawn()
-            .map_err(|err| SortError::CompressProgExecutionFailed {
-                code: err.raw_os_error().unwrap(),
-            })?;
-        let child_stdout = child.stdout.take().unwrap();
-        Ok(CompressedTmpMergeInput {
-            path: self.path,
-            compress_prog: self.compress_prog,
-            child,
-            child_stdout,
-        })
-    }
-}
-impl MergeInput for CompressedTmpMergeInput {
-    type InnerRead = ChildStdout;
-
-    fn finished_reading(self) -> UResult<()> {
-        drop(self.child_stdout);
-        check_child_success(self.child, &self.compress_prog)?;
-        let _ = fs::remove_file(self.path);
-        Ok(())
-    }
-
-    fn as_read(&mut self) -> &mut Self::InnerRead {
-        &mut self.child_stdout
-    }
+    compress_prog: Option<String>,
 }
 
-pub struct PlainMergeInput<R: Read + Send> {
-    inner: R,
-}
-impl<R: Read + Send> MergeInput for PlainMergeInput<R> {
-    type InnerRead = R;
-    fn finished_reading(self) -> UResult<()> {
-        Ok(())
-    }
-    fn as_read(&mut self) -> &mut Self::InnerRead {
-        &mut self.inner
+impl ClosedTmpFile {
+    /// Reopens the temporary file.
+    pub fn reopen(self) -> UResult<MergeInput> {
+        if let Some(compress_prog) = self.compress_prog {
+            let mut command = Command::new(&compress_prog);
+            let file = File::open(&self.path).unwrap();
+            command.stdin(file).stdout(Stdio::piped()).arg("-d");
+            let mut child =
+                command
+                    .spawn()
+                    .map_err(|err| SortError::CompressProgExecutionFailed {
+                        code: err.raw_os_error().unwrap(),
+                    })?;
+            let child_stdout = child.stdout.take().unwrap();
+            Ok(MergeInput::CompressedTmpFile {
+                path: self.path,
+                compress_prog,
+                child,
+                child_stdout,
+            })
+        } else {
+            Ok(MergeInput::TmpFile {
+                file: File::open(&self.path)
+                    .map_err(|error| SortError::OpenTmpFileFailed { error })?,
+                path: self.path,
+            })
+        }
     }
 }
