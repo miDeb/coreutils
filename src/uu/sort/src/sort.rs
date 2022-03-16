@@ -147,6 +147,10 @@ enum SortError {
         path: PathBuf,
         error: std::io::Error,
     },
+    WriteFailed {
+        quoted_path: String,
+        error: std::io::Error,
+    },
     ParseKeyError {
         key: String,
         msg: String,
@@ -216,6 +220,9 @@ impl Display for SortError {
                     path.maybe_quote(),
                     strip_errno(error)
                 )
+            }
+            SortError::WriteFailed { quoted_path, error } => {
+                write!(f, "write failed: {}: {}", quoted_path, strip_errno(error))
             }
             SortError::OpenTmpFileFailed { error } => {
                 write!(f, "failed to open temporary file: {}", strip_errno(error))
@@ -548,16 +555,17 @@ impl<'a> Line<'a> {
         Self { line, index }
     }
 
-    fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) {
+    fn print(&self, writer: &mut impl Write, settings: &GlobalSettings) -> std::io::Result<()> {
         if settings.zero_terminated && !settings.debug {
-            writer.write_all(self.line.as_bytes()).unwrap();
-            writer.write_all(b"\0").unwrap();
+            writer.write_all(self.line.as_bytes())?;
+            writer.write_all(b"\0")?;
         } else if !settings.debug {
-            writer.write_all(self.line.as_bytes()).unwrap();
-            writer.write_all(b"\n").unwrap();
+            writer.write_all(self.line.as_bytes())?;
+            writer.write_all(b"\n")?;
         } else {
-            self.print_debug(settings, writer).unwrap();
+            self.print_debug(settings, writer)?;
         }
+        Ok(())
     }
 
     /// Writes indicators for the selections this line matched. The original line content is NOT expected
@@ -1708,8 +1716,6 @@ fn general_f64_parse(a: &str) -> GeneralF64ParseResult {
 }
 
 /// Compares two floats, with errors and non-numerics assumed to be -inf.
-/// Stops coercing at the first non-numeric char.
-/// We explicitly need to convert to f64 in this case.
 fn general_numeric_compare(a: &GeneralF64ParseResult, b: &GeneralF64ParseResult) -> Ordering {
     a.partial_cmp(b).unwrap()
 }
@@ -1778,28 +1784,34 @@ fn month_parse(line: &str) -> Month {
 }
 
 fn month_compare(a: &str, b: &str) -> Ordering {
-    #![allow(clippy::comparison_chain)]
-    let ma = month_parse(a);
-    let mb = month_parse(b);
-
-    if ma > mb {
-        Ordering::Greater
-    } else if ma < mb {
-        Ordering::Less
-    } else {
-        Ordering::Equal
-    }
+    month_parse(a).cmp(&month_parse(b))
 }
 
 fn print_sorted<'a, T: Iterator<Item = &'a Line<'a>>>(
     iter: T,
     settings: &GlobalSettings,
     output: Output,
-) {
+) -> UResult<()> {
+    let quoted_output_file_name = output
+        .as_output_name()
+        .unwrap_or("standard output")
+        .maybe_quote()
+        .to_string();
     let mut writer = output.into_write();
     for line in iter {
-        line.print(&mut writer, settings);
+        if let Err(e) = line.print(&mut writer, settings) {
+            return Err(SortError::WriteFailed {
+                quoted_path: quoted_output_file_name,
+                error: e,
+            }
+            .into());
+        }
     }
+    writer.flush().map_err(|e| SortError::WriteFailed {
+        quoted_path: quoted_output_file_name,
+        error: e,
+    })?;
+    Ok(())
 }
 
 fn open(path: impl AsRef<OsStr>) -> UResult<Box<dyn Read + Send>> {

@@ -275,12 +275,12 @@ impl<'a> FileMerger<'a> {
     }
 
     pub fn write_all_to(mut self, settings: &GlobalSettings, out: &mut impl Write) -> UResult<()> {
-        while self.write_next(settings, out) {}
+        while self.write_next(settings, out)? {}
         drop(self.request_sender);
         self.reader_join_handle.join().unwrap()
     }
 
-    fn write_next(&mut self, settings: &GlobalSettings, out: &mut impl Write) -> bool {
+    fn write_next(&mut self, settings: &GlobalSettings, out: &mut impl Write) -> UResult<bool> {
         if let Some(file) = self.heap.peek() {
             let prev = self.prev.replace(PreviousLine {
                 chunk: file.current_chunk.clone(),
@@ -300,12 +300,12 @@ impl<'a> FileMerger<'a> {
                             file.current_chunk.line_data(),
                         );
                         if cmp == Ordering::Equal {
-                            return;
+                            return Ok(());
                         }
                     }
                 }
-                current_line.print(out, settings);
-            });
+                current_line.print(out, settings)
+            })?;
 
             let was_last_line_for_file = file.current_chunk.lines().len() == file.line_idx + 1;
 
@@ -332,7 +332,7 @@ impl<'a> FileMerger<'a> {
                 }
             }
         }
-        !self.heap.is_empty()
+        Ok(!self.heap.is_empty())
     }
 }
 
